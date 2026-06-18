@@ -80,7 +80,11 @@ VAULT_DB = os.environ.get("VAULT_DB", str(SCRIPT_DIR / "ltm_cache.db"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3")
 
-EXCLUDE_PARTS = ("90_Engine", ".git", ".obsidian")
+# 아카이브 계층(05_Inbox/06_Raw)은 node 네임스페이스에서 제외한다.
+# raw/inbox는 wikilink 타깃이 아니라 source_path(상대 경로)로만 참조되며,
+# 인덱싱 가능한 대리물은 50_Source_Summaries의 source-summary node다.
+# (indexer.collect_markdown_files의 exclude 기본값과 일치해야 한다.)
+EXCLUDE_PARTS = ("90_Engine", ".git", ".obsidian", "05_Inbox", "06_Raw")
 EDGE_HEADING = "## 핵심 엣지"
 EMPTY_EDGE_PLACEHOLDER = "<!-- 아직 엣지 없음 -->"
 

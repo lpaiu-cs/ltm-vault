@@ -22,8 +22,8 @@ tags:
   - LTM
 status: evergreen
 created: 2026-05-25
-updated: 2026-05-25
-version: 1.0
+updated: 2026-06-18
+version: 1.1
 node_id: 0a1b2c3d-4e5f-4a78-9b8c-0d1e2f3a4b5c
 embedding_model: null
 embedding_hash: null
@@ -43,6 +43,31 @@ source_urls: []
 > - **인간 작성자**: §1·§2·§4를 참조하여 술어를 선택
 > - **AI 에이전트**: §5의 3-Layer Binding 사양에 따라 시스템 프롬프트·Tool Call·인덱서 정규식에 본 명세를 바인딩
 > - **DuckDB 인덱서**: `90_Engine/ltm_cache.db`의 `edges.predicate` CHECK 제약을 본 명세의 9개 화이트리스트로 강제
+
+---
+
+## §0. 그래프 적용 범위 (Second Brain Scope)
+
+> [!IMPORTANT] 그래프는 "안정 지식"만을 위한 것
+> 본 저장소는 [[Second Brain Operating Model]]을 따르는 LLM-native second brain으로
+> 확장되었습니다. 9개 predicate 엣지는 **내구성 있는 지식 그래프 관계(durable
+> semantic relationships)**에만 사용합니다.
+
+- predicate 엣지는 *안정적인* 의미 관계를 표현하기 위한 것이지, 모든 연결·모든
+  일시적 연관을 표현하기 위한 것이 아니다.
+- **raw source / inbox / decision / review / open question / contradiction 항목을
+  predicate 그래프에 강제로 편입하지 않는다.** 이들은 wikilink와 frontmatter `related`로
+  느슨하게 연결하고, 진짜 내구성 있는 관계가 명확할 때만 엣지를 선언한다.
+- `05_Inbox/`와 `06_Raw/`는 인덱서가 그래프 node로 만들지 않는다(설계상 제외,
+  `90_Engine/indexer.py`의 `collect_markdown_files` exclude 참조). 원본의 인덱싱
+  가능한 대리물은 `50_Source_Summaries/`의 source-summary node다.
+- 해석 계층 사이의 **진짜 안정 관계**에는 엣지가 적절하다. 예:
+  - 새 결정이 옛 결정을 대체: `[[새 결정]] replaces [[옛 결정]]`
+  - 한 이론이 다른 이론과 정면 충돌: `[[A]] contradicts [[B]]`
+- 모호하면 엣지를 선언하지 않는다(§4 Fallback의 최후 명령 "불확실하면 비워라"와 동일).
+
+이 범위 규칙은 §1~§6의 술어 정의·분기·금지 사례와 함께 적용됩니다. 즉 *어떤 술어를
+쓸지*는 §1~§4가, *애초에 엣지를 쓸지 말지*는 본 §0이 통제합니다.
 
 ---
 
@@ -393,6 +418,7 @@ EDGE_REGEX = (
 | 버전 | 일자 | 변경 내용 |
 |------|------|-----------|
 | 1.0 | 2026-05-25 | 최초 제정. 9개 술어 + 4개 Confusion Pairs + 3-Layer Binding + 5건 자동 수정 |
+| 1.1 | 2026-06-18 | §0 그래프 적용 범위 추가. Second Brain 확장에 맞춰 predicate 엣지를 "내구성 있는 안정 지식 관계"로 한정. raw/inbox/decision/review를 그래프에 강제 편입하지 않음을 명문화. 술어 정의(§1~§9) 자체는 불변. |
 
 ---
 

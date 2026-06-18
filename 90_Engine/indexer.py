@@ -212,7 +212,19 @@ def strip_frontmatter_for_embedding(content):
 # ─────────────────────────────────────────────────────────────
 # §5. 인덱싱 파이프라인
 # ─────────────────────────────────────────────────────────────
-def collect_markdown_files(vault_root, exclude=("90_Engine", ".git", ".obsidian")):
+def collect_markdown_files(vault_root, exclude=(
+    "90_Engine", ".git", ".obsidian",
+    # Second Brain 아카이브 계층: 인덱싱 대상에서 제외한다.
+    #  - 05_Inbox: 아직 처리되지 않은 미가공 인입물(휘발성)
+    #  - 06_Raw  : 불변 원본(증거). raw 채팅 로그 등은 `[[A]] pred [[B]]` 형태의
+    #              문장을 포함할 수 있어 false edge를 유발하고, 그래프를 오염시킨다.
+    # 원본은 50_Source_Summaries의 source-summary node(= source_path로 raw를 가리킴)가
+    # 인덱싱 가능한 대리물 역할을 한다. 즉 "raw는 진실의 원천이되 그래프 node는 아니다".
+    "05_Inbox", "06_Raw",
+)):
+    # TODO(engine): 폴더별 인덱싱 정책을 명시적으로 분리(예: 06_Raw는 전문 검색만,
+    #   30_Projects/40_Decisions는 node+edge, 80_Reviews는 검색 우선순위 강등)하는
+    #   per-folder index policy를 도입할 것. 현재는 디렉터리 이름 기반 단순 제외만 수행.
     files = []
     for path in vault_root.rglob("*.md"):
         if any(part in exclude for part in path.parts):
