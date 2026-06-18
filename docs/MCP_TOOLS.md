@@ -28,9 +28,21 @@
   - `include_reviews=True` → `60/70/80` 포함.
   - `include_raw=False` → `06_Raw` 제외.
   - `confidence_weighting=False` → confidence 강등 끔.
-- 반환 JSON의 `nodes[]`에는 각 node의 `layer/confidence/status/score`가 표기되고,
-  XML 캡슐의 `<node>` 태그에도 `layer/confidence/status` 속성이 붙습니다. `scope` 필드로
-  적용된 스코프를 확인할 수 있습니다. 에이전트는 이 메타로 출처·불확실성을 판단하세요.
+- 반환 JSON의 `nodes[]`에는 각 node의 `layer/confidence/status/annotation/score`가
+  표기되고, XML 캡슐의 `<node>` 태그에도 같은 속성이 붙습니다. `scope` 필드로 적용된
+  스코프와 `policy_source`를 확인할 수 있습니다. 에이전트는 이 메타로 출처·불확실성을 판단하세요.
+
+#### 가중치 설정 (config) & 평가
+
+- 가중치/필터/주석은 코드 상수가 아니라 **`00_System/Retrieval Policy.yaml`**에서
+  로드됩니다(없으면 retriever 내장 fallback). 우선순위: env `VAULT_RETRIEVAL_POLICY`
+  → `00_System/Retrieval Policy.yaml` → `90_Engine/retrieval_policy.yaml` → 내장.
+  PyYAML이 있으면 사용하고, 없으면 내장 최소 파서로 읽습니다(선택 의존성).
+- **필터(`default_include`)와 랭킹 가중치(`weight`)는 분리**되어 있습니다. 예: `06_Raw`는
+  기본 포함+낮은 가중치, `80_Reviews`는 기본 제외+매우 낮은 가중치.
+- 이 가중치는 경험적 최적값이 아니라 **잠정적 사전값(provisional prior)**입니다.
+  실측 튜닝은 `python3 90_Engine/eval_retrieval.py --db <cache> --queries <set>`로
+  MRR@5/Recall@5/`review_leakage_rate`/`raw_overexposure_rate`를 보며 합니다.
 
 ## Write Tools
 

@@ -1,0 +1,33 @@
+{
+  "description": "Provisional retrieval eval set. 'expected'는 해당 쿼리에서 top-k에 떠야 하는 node 제목(파일 stem). 경험적 정답이 아니라 출발점이므로 사용하며 보강할 것. (실데이터/도메인에 맞게 교체 권장)",
+  "queries": [
+    {
+      "query": "왜 LLM은 strawberry의 r 개수를 못 세나?",
+      "expected": ["Byte Pair Encoding", "Tokenizer", "Glitch Tokens"]
+    },
+    {
+      "query": "Vibe Coding의 위험은 무엇인가?",
+      "expected": ["Vibe Coding", "Reflection Loop", "Hallucination as Default"]
+    },
+    {
+      "query": "트랜스포머 아키텍처의 핵심",
+      "expected": ["Transformer"]
+    },
+    {
+      "query": "Software 2.0이란 무엇인가?",
+      "expected": ["Software 2.0"]
+    },
+    {
+      "query": "LLM OS의 메모리(컨텍스트) 관리",
+      "expected": ["LLM OS", "Context Window"]
+    },
+    {
+      "query": "PyTorch 없이 순수 C로 GPT 학습하기",
+      "expected": ["llm.c"]
+    },
+    {
+      "query": "The Bitter Lesson과 규칙 기반 AI의 충돌",
+      "expected": ["The Bitter Lesson", "Rule-based AI"]
+    }
+  ]
+}

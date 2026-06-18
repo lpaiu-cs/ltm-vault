@@ -69,33 +69,61 @@ DEFAULT_EMBED_MODEL = "bge-m3"
 # ─────────────────────────────────────────────────────────────
 # §1.5 Second Brain 계층/신뢰도 인지 검색 (layer & confidence aware)
 # ─────────────────────────────────────────────────────────────
-# 계층별 랭킹 가중치: 검증된 지식 계층은 높게, 원본(full-text)·검토/메타 계층은 강등.
+# 랭킹 가중치·필터·주석은 설정 파일(00_System/Retrieval Policy.yaml 또는
+# 90_Engine/retrieval_policy.yaml, 또는 env VAULT_RETRIEVAL_POLICY)에서 로드한다.
+# 아래 상수는 "설정이 없을 때의 fallback default"다. 이 값들은 경험적 최적값이
+# 아니라 **잠정적 사전값(provisional prior)**이며, 실측 튜닝은 eval_retrieval.py로 한다.
+
+# ── Fallback: 계층 랭킹 가중치 (검증 지식↑, 원본/검토 계층↓) ──
 LAYER_RANK_WEIGHT = {
-    "20_Concepts":          1.0,
-    "50_Source_Summaries":  1.0,
-    "10_MOC":               0.95,
-    "40_Decisions":         0.95,
-    "30_Projects":          0.9,
-    "00_System":            0.85,
-    "06_Raw":               0.5,   # 전문검색 전용 → 강등 (요약/개념보다 낮게)
-    "60_Open_Questions":    0.45,  # 메타/검토 계층
-    "70_Contradictions":    0.45,
-    "80_Reviews":           0.35,
+    "20_Concepts": 1.0, "50_Source_Summaries": 1.0, "10_MOC": 0.95,
+    "40_Decisions": 0.95, "30_Projects": 0.9, "00_System": 0.85,
+    "06_Raw": 0.5, "60_Open_Questions": 0.45, "70_Contradictions": 0.45,
+    "80_Reviews": 0.35,
 }
 DEFAULT_LAYER_WEIGHT = 0.8
 
-# 신뢰도 가중치: confidence 미표기(예: evergreen 개념)는 패널티 없음(1.0)
+# ── Fallback: 기본 검색 포함 여부(필터) — 가중치와 분리. 미지정은 default_include ──
+LAYER_DEFAULT_INCLUDE = {
+    "60_Open_Questions": False, "70_Contradictions": False, "80_Reviews": False,
+}
+DEFAULT_LAYER_INCLUDE = True
+
+# ── Fallback: 결과 주석(annotation) ──
+LAYER_ANNOTATION = {
+    "06_Raw": "raw evidence, unprocessed",
+    "50_Source_Summaries": "source summary",
+    "40_Decisions": "decision record",
+    "30_Projects": "project dashboard",
+    "20_Concepts": "durable concept",
+    "10_MOC": "map of content",
+    "00_System": "system policy",
+    "60_Open_Questions": "open question",
+    "70_Contradictions": "contradiction / unresolved",
+    "80_Reviews": "low-confidence / possible hallucination",
+}
+DEFAULT_ANNOTATION = ""
+
+# ── Fallback: 신뢰도/상태 가중치 ──
 CONFIDENCE_WEIGHT = {"high": 1.0, "medium": 0.85, "low": 0.6}
 DEFAULT_CONFIDENCE_WEIGHT = 1.0
-
-# 상태 가중치: 폐기/대체/낡음 상태는 강등 (그 외 active/open/evergreen 등은 1.0)
-STATUS_WEIGHT = {"superseded": 0.3, "rejected": 0.25, "deprecated": 0.3,
-                 "stale": 0.4}
+STATUS_WEIGHT = {"active": 1.0, "evergreen": 1.0, "open": 1.0,
+                 "superseded": 0.3, "rejected": 0.25, "deprecated": 0.3, "stale": 0.4}
 DEFAULT_STATUS_WEIGHT = 1.0
 
-# 기본 검색에서 제외되는 메타/검토 계층 (include_reviews=True로 포함 가능)
+# 원본/검토 계층 식별 (필터 toggle용 상수)
 REVIEW_LAYERS = ("60_Open_Questions", "70_Contradictions", "80_Reviews")
 RAW_LAYER = "06_Raw"
+
+# 설정 파일 이름
+POLICY_FILENAME_SYSTEM = "Retrieval Policy.yaml"   # 00_System/
+POLICY_FILENAME_ENGINE = "retrieval_policy.yaml"   # 90_Engine/
+
+try:
+    import yaml as _yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
 
 _LAYER_DIR_RE = re.compile(r"^\d{2}_")
 
@@ -124,14 +152,139 @@ def parse_frontmatter_fields(content):
     return out
 
 
-def compute_rank_weight(layer, confidence, status, confidence_weighting=True):
-    """계층 × 신뢰도 × 상태 가중치 곱. 1.0 기준에서 강등 요소만 반영."""
-    w = LAYER_RANK_WEIGHT.get(layer, DEFAULT_LAYER_WEIGHT)
+# ─────────────────────────────────────────────────────────────
+# §1.6 Retrieval Policy 로더 (PyYAML 있으면 사용, 없으면 내장 최소 파서)
+# ─────────────────────────────────────────────────────────────
+def _coerce_scalar(v):
+    v = v.strip()
+    if (v[:1] == '"' and v[-1:] == '"') or (v[:1] == "'" and v[-1:] == "'"):
+        return v[1:-1]
+    low = v.lower()
+    if low in ("true", "yes"):
+        return True
+    if low in ("false", "no"):
+        return False
+    if low in ("null", "~", ""):
+        return None
+    if re.fullmatch(r"-?\d+", v):
+        return int(v)
+    try:
+        return float(v)
+    except ValueError:
+        return v
+
+
+def _parse_block_yaml(text):
+    """의존성 없는 최소 블록 YAML 파서(중첩 맵 + 스칼라). 리스트/인라인 flow 미지원.
+    PyYAML 미설치 시의 fallback 경로. 들여쓰기는 공백 기준."""
+    root = {}
+    stack = [(-1, root)]
+    for raw in text.splitlines():
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        if ":" not in line:
+            continue  # 리스트 항목 등은 미지원 → 스킵
+        while len(stack) > 1 and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1]
+        key, _, val = line.partition(":")
+        key = key.strip().strip('"').strip("'")
+        val = val.strip()
+        if val == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = _coerce_scalar(val)
+    return root
+
+
+def _load_policy_file(path):
+    text = Path(path).read_text(encoding="utf-8")
+    if HAS_YAML:
+        return _yaml.safe_load(text) or {}
+    return _parse_block_yaml(text)
+
+
+def _resolve_policy(cfg):
+    """파일 설정(cfg)을 fallback default 위에 병합해 해석된 정책 dict를 반환."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    layers_cfg = cfg.get("layers") or {}
+    lw, li, la = dict(LAYER_RANK_WEIGHT), dict(LAYER_DEFAULT_INCLUDE), dict(LAYER_ANNOTATION)
+    for name, spec in layers_cfg.items():
+        spec = spec or {}
+        if spec.get("weight") is not None:
+            lw[name] = float(spec["weight"])
+        if spec.get("default_include") is not None:
+            li[name] = bool(spec["default_include"])
+        if spec.get("annotation") is not None:
+            la[name] = str(spec["annotation"])
+    dl = cfg.get("default_layer") or {}
+    cw = dict(CONFIDENCE_WEIGHT)
+    cw.update({k: float(v) for k, v in (cfg.get("confidence_weight") or {}).items()})
+    sw = dict(STATUS_WEIGHT)
+    sw.update({k: float(v) for k, v in (cfg.get("status_weight") or {}).items()})
+    return {
+        "layer_weight": lw,
+        "default_layer_weight": float(dl.get("weight", DEFAULT_LAYER_WEIGHT)),
+        "layer_include": li,
+        "default_include": bool(dl.get("default_include", DEFAULT_LAYER_INCLUDE)),
+        "layer_annotation": la,
+        "default_annotation": str(dl.get("annotation", DEFAULT_ANNOTATION)),
+        "confidence_weight": cw,
+        "default_confidence_weight": float(cfg.get("default_confidence_weight", DEFAULT_CONFIDENCE_WEIGHT)),
+        "status_weight": sw,
+        "default_status_weight": float(cfg.get("default_status_weight", DEFAULT_STATUS_WEIGHT)),
+        "raw_policy": cfg.get("raw_policy") or {"embed": True},
+    }
+
+
+def load_retrieval_policy(vault_root=None, explicit_path=None):
+    """설정 파일을 찾아 해석된 정책을 반환. 없으면 fallback default.
+
+    Returns: (policy_dict, source_path_or_None)
+    """
+    candidates = []
+    if explicit_path:
+        candidates.append(Path(explicit_path))
+    env = os.environ.get("VAULT_RETRIEVAL_POLICY")
+    if env:
+        candidates.append(Path(env))
+    if vault_root:
+        candidates.append(Path(vault_root) / "00_System" / POLICY_FILENAME_SYSTEM)
+    candidates.append(Path(__file__).resolve().parent / POLICY_FILENAME_ENGINE)
+    for c in candidates:
+        try:
+            if c and c.exists():
+                return _resolve_policy(_load_policy_file(c)), str(c)
+        except Exception as e:
+            sys.stderr.write(f"[retriever] 정책 파일 로드 실패({c}): {e} — fallback 사용\n")
+            continue
+    return _resolve_policy({}), None
+
+
+# 설정 파일 없을 때의 해석된 fallback 정책
+DEFAULT_RETRIEVAL_POLICY = _resolve_policy({})
+
+
+def compute_rank_weight(layer, confidence, status, confidence_weighting=True, policy=None):
+    """계층 × 신뢰도 × 상태 가중치 곱. policy 미지정 시 fallback default 사용."""
+    pol = policy or DEFAULT_RETRIEVAL_POLICY
+    w = pol["layer_weight"].get(layer, pol["default_layer_weight"])
     if confidence_weighting and confidence:
-        w *= CONFIDENCE_WEIGHT.get(str(confidence).lower(), DEFAULT_CONFIDENCE_WEIGHT)
+        w *= pol["confidence_weight"].get(str(confidence).lower(),
+                                          pol["default_confidence_weight"])
     if status:
-        w *= STATUS_WEIGHT.get(str(status).lower(), DEFAULT_STATUS_WEIGHT)
+        w *= pol["status_weight"].get(str(status).lower(), pol["default_status_weight"])
     return w
+
+
+def layer_included(layer, policy=None):
+    """기본 검색 스코프 포함 여부(필터). policy 미지정 시 fallback."""
+    pol = policy or DEFAULT_RETRIEVAL_POLICY
+    return pol["layer_include"].get(layer, pol["default_include"])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -388,8 +541,9 @@ def strip_frontmatter(content):
 
 
 def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
-                          activated_edges, nodes, max_nodes=10):
+                          activated_edges, nodes, max_nodes=10, annotations=None):
     out_ids = [nid for nid in ranked_ids[:max_nodes] if nid in nodes]
+    annotations = annotations or {}
     layer1 = {
         "query": query,
         "seed_nodes": [nodes[sid]["title"] for sid in seed_ids if sid in nodes],
@@ -399,7 +553,7 @@ def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
             for e in activated_edges
             if e["source_id"] in nodes and e["target_id"] in nodes
         ][:20],
-        # 계층/신뢰도/상태를 함께 표기 → 에이전트가 출처·불확실성을 스스로 판단
+        # 계층/신뢰도/상태/주석을 함께 표기 → 에이전트가 출처·불확실성을 스스로 판단
         "nodes": [
             {
                 "title": nodes[nid]["title"],
@@ -407,6 +561,7 @@ def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
                 "type": nodes[nid].get("type"),
                 "confidence": nodes[nid].get("confidence"),
                 "status": nodes[nid].get("status"),
+                "annotation": annotations.get(nid),
                 "score": round(node_scores[nid], 4),
             }
             for nid in out_ids
@@ -425,6 +580,8 @@ def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
             attrs += f' confidence="{n["confidence"]}"'
         if n.get("status"):
             attrs += f' status="{n["status"]}"'
+        if annotations.get(nid):
+            attrs += f' annotation="{annotations[nid]}"'
         xml_parts.append(f'  <node {attrs}>\n{body}\n  </node>')
     xml_parts.append("</retrieved_vault_context>")
     return {
@@ -438,36 +595,45 @@ def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
 # ─────────────────────────────────────────────────────────────
 class Retriever:
     def __init__(self, db_path, ollama_url=DEFAULT_OLLAMA_URL,
-                 embed_model=DEFAULT_EMBED_MODEL):
+                 embed_model=DEFAULT_EMBED_MODEL, vault_root=None,
+                 policy_path=None):
         self.db_path = db_path
         self.ollama_url = ollama_url
         self.embed_model = embed_model
+        # vault_root: 명시값 → 없으면 db 경로(90_Engine/ltm_cache.db)에서 추정
+        self.vault_root = (Path(vault_root).resolve() if vault_root
+                           else Path(db_path).resolve().parent.parent)
+        self.policy, self.policy_source = load_retrieval_policy(
+            self.vault_root, explicit_path=policy_path)
         self.conn, self.nodes, self.edges = load_vault_graph(db_path)
         n_with_emb = sum(1 for n in self.nodes.values() if n["has_embedding"])
         print(f"[*] Loaded {len(self.nodes)} nodes, {len(self.edges)} edges "
               f"({n_with_emb} with embedding)")
+        print(f"[*] Retrieval policy: {self.policy_source or 'built-in fallback (provisional prior)'}")
 
     def retrieve(self, query, top_k=5, max_hops=2,
                  threshold=ADAPTIVE_HOP_THRESHOLD, max_nodes=10,
                  include_raw=True, include_reviews=False,
                  include_layers=None, exclude_layers=None,
                  confidence_weighting=True):
-        """계층/신뢰도 인지 검색.
+        """계층/신뢰도 인지 검색. 가중치·필터·주석은 Retrieval Policy(설정)에서 온다.
 
         include_raw:      06_Raw(full-text 전용)를 후보에 포함할지 (기본 True, 강등됨)
-        include_reviews:  60/70/80(검토·메타) 계층 포함할지 (기본 False)
+        include_reviews:  기본 제외(default_include=false) 계층까지 포함할지 (기본 False)
         include_layers:   주면 이 계층들로만 제한(다른 필터 무시)
         exclude_layers:   추가로 제외할 계층 목록
         confidence_weighting: confidence(low/medium) 강등 적용 여부 (기본 True)
         """
-        # ── 검색 스코프(allowed layers) 결정 ──
+        pol = self.policy
         all_layers = {n.get("layer") for n in self.nodes.values()}
+
+        # ── 검색 스코프(allowed layers) 결정: 필터는 정책의 default_include로 ──
         if include_layers is not None:
             allowed_layers = set(include_layers)
         else:
-            allowed_layers = set(all_layers)
-            if not include_reviews:
-                allowed_layers -= set(REVIEW_LAYERS)
+            allowed_layers = {L for L in all_layers if layer_included(L, pol)}
+            if include_reviews:  # 기본 제외 계층(60/70/80 등)까지 포함
+                allowed_layers |= {L for L in all_layers if not layer_included(L, pol)}
             if not include_raw:
                 allowed_layers.discard(RAW_LAYER)
             if exclude_layers:
@@ -475,10 +641,14 @@ class Retriever:
         allowed_ids = {nid for nid, n in self.nodes.items()
                        if n.get("layer") in allowed_layers}
 
-        # ── 계층 × 신뢰도 × 상태 가중치 ──
+        # ── 랭킹 가중치(계층 × 신뢰도 × 상태)와 주석은 정책 기반 ──
         weights = {
             nid: compute_rank_weight(n.get("layer"), n.get("confidence"),
-                                     n.get("status"), confidence_weighting)
+                                     n.get("status"), confidence_weighting, pol)
+            for nid, n in self.nodes.items()
+        }
+        annotations = {
+            nid: pol["layer_annotation"].get(n.get("layer"), pol["default_annotation"])
             for nid, n in self.nodes.items()
         }
 
@@ -495,13 +665,14 @@ class Retriever:
         ranked_ids = [nid for nid in ranked_ids if nid in allowed_ids]
         output = format_hybrid_output(
             query, seed_ids, ranked_ids, node_scores, activated,
-            self.nodes, max_nodes=max_nodes
+            self.nodes, max_nodes=max_nodes, annotations=annotations,
         )
         output["mode"] = mode
         output["scope"] = {
             "include_raw": include_raw,
             "include_reviews": include_reviews,
             "allowed_layers": sorted(l for l in allowed_layers if l),
+            "policy_source": self.policy_source or "built-in fallback",
         }
         return output
 
@@ -529,7 +700,8 @@ if HAS_FASTAPI:
             db = os.environ.get("VAULT_DB", "/tmp/ltm_v5.db")
             url = os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
             model = os.environ.get("OLLAMA_MODEL", DEFAULT_EMBED_MODEL)
-            _instance = Retriever(db, url, model)
+            _instance = Retriever(db, url, model,
+                                  vault_root=os.environ.get("VAULT_ROOT"))
         return _instance
 
     @app.post("/retrieve")
@@ -563,12 +735,23 @@ def main():
     parser.add_argument("--max-nodes", type=int, default=10)
     parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL)
     parser.add_argument("--ollama-model", default=DEFAULT_EMBED_MODEL)
+    parser.add_argument("--policy", default=None, help="Retrieval Policy 파일 경로(override)")
+    parser.add_argument("--vault-root", default=None, help="vault 루트(정책 탐색용)")
+    parser.add_argument("--include-reviews", action="store_true",
+                        help="60/70/80 검토·메타 계층까지 검색에 포함")
+    parser.add_argument("--no-raw", action="store_true", help="06_Raw 제외")
+    parser.add_argument("--no-confidence-weighting", action="store_true",
+                        help="confidence 강등 끄기")
     parser.add_argument("--json-only", action="store_true")
     args = parser.parse_args()
 
-    r = Retriever(args.db, args.ollama_url, args.ollama_model)
+    r = Retriever(args.db, args.ollama_url, args.ollama_model,
+                  vault_root=args.vault_root, policy_path=args.policy)
     result = r.retrieve(args.query, top_k=args.top_k, max_hops=args.hops,
-                         threshold=args.threshold, max_nodes=args.max_nodes)
+                         threshold=args.threshold, max_nodes=args.max_nodes,
+                         include_raw=not args.no_raw,
+                         include_reviews=args.include_reviews,
+                         confidence_weighting=not args.no_confidence_weighting)
     print()
     print("=" * 64)
     print(f"  Query: {args.query}")

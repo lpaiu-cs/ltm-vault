@@ -110,7 +110,7 @@ def get_retriever():
                 f"먼저 'python3 indexer.py --embed --force' 실행 필요"
             )
         _retriever_cache = retriever_mod.Retriever(
-            VAULT_DB, OLLAMA_URL, OLLAMA_MODEL
+            VAULT_DB, OLLAMA_URL, OLLAMA_MODEL, vault_root=VAULT_ROOT
         )
     return _retriever_cache
 

@@ -156,6 +156,25 @@ node edge predicate는 9개만 허용됩니다.
 
 AI가 메모리를 직접 쓰는 경우의 권장 흐름은 [docs/MCP_TOOLS.md](docs/MCP_TOOLS.md)를 따릅니다.
 
+## 7. 검색 정책과 평가 (선택)
+
+검색은 계층/신뢰도 인지입니다. 랭킹 가중치·필터·주석은
+[00_System/Retrieval Policy.yaml](00_System/Retrieval%20Policy.yaml)에서 로드됩니다(없으면
+retriever 내장 fallback). PyYAML이 있으면 사용하고, 없으면 내장 최소 파서로 읽으므로
+추가 설치는 선택입니다(`pip install pyyaml`).
+
+이 가중치는 **잠정적 사전값(provisional prior)**입니다. 검색 품질을 측정·튜닝하려면:
+
+```bash
+python3 90_Engine/eval_retrieval.py \
+  --db 90_Engine/ltm_cache.db \
+  --queries 90_Engine/eval_queries.sample.json
+```
+
+`MRR@5`, `Recall@5`, `review_leakage_rate`(검토 계층 누수=기본 0), `raw_overexposure_rate`
+(원본 과다노출)를 보고 `Retrieval Policy.yaml`을 조정하세요. 자세한 내용은
+[40_Decisions/2026-06-18-layer-and-confidence-aware-retrieval.md](40_Decisions/2026-06-18-layer-and-confidence-aware-retrieval.md).
+
 ## Troubleshooting
 
 ### `ollama: command not found`

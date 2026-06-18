@@ -116,6 +116,9 @@ related:
 >   (`50_Source_Summaries/`)이 그래프상 대리물 역할을 한다.
 > - 검색 랭킹은 `계층 × confidence × status` 가중치로 차등. 낮은 신뢰도·폐기 항목은
 >   강등+표기. 검토/메타 계층(`60/70/80`)은 기본 검색에서 제외(필요 시 포함 가능).
+> - 가중치·필터·주석은 `00_System/Retrieval Policy.yaml`에서 로드됩니다(없으면 내장
+>   fallback). 이 값은 **잠정적 사전값(provisional prior)**이며, `90_Engine/eval_retrieval.py`로
+>   측정·튜닝합니다(필터 `default_include`와 가중치 `weight`는 분리).
 
 ---
 

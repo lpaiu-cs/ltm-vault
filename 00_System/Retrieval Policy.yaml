@@ -1,0 +1,100 @@
+# 00_System/Retrieval Policy.yaml
+# ─────────────────────────────────────────────────────────────
+# 검색(retrieval) 랭킹/필터/주석 정책.
+#
+# ⚠️ 이 값들은 경험적 최적값(empirical optimum)이 아니라 **잠정적 사전값
+#    (provisional prior)**이다. 실데이터로 90_Engine/eval_retrieval.py를 돌려
+#    MRR@5 / Recall@5 / review_leakage_rate / raw_overexposure_rate를 보고 조정하라.
+#
+# 로드 우선순위(90_Engine/retriever.py):
+#   1) env VAULT_RETRIEVAL_POLICY  2) 이 파일(00_System/Retrieval Policy.yaml)
+#   3) 90_Engine/retrieval_policy.yaml  4) (없으면) retriever.py 내장 fallback
+#
+# 파서: PyYAML이 있으면 사용, 없으면 내장 최소 블록-YAML 파서로 읽는다.
+# 따라서 **블록 스타일만** 쓰고, 데이터 줄에 인라인 주석을 달지 말 것.
+# (리스트/인라인 flow 맵은 내장 파서가 지원하지 않는다.)
+# ─────────────────────────────────────────────────────────────
+
+version: 1
+
+# 계층별 정책: filter(default_include)와 ranking weight를 분리한다.
+#   default_include : 기본 검색 스코프에 포함할지 (필터)
+#   weight          : 랭킹 점수 배수 (가중치)
+#   annotation      : 검색 결과에 함께 표기할 라벨
+layers:
+  20_Concepts:
+    default_include: true
+    weight: 1.0
+    annotation: durable concept
+  50_Source_Summaries:
+    default_include: true
+    weight: 1.0
+    annotation: source summary
+  10_MOC:
+    default_include: true
+    weight: 0.95
+    annotation: map of content
+  40_Decisions:
+    default_include: true
+    weight: 0.95
+    annotation: decision record
+  30_Projects:
+    default_include: true
+    weight: 0.9
+    annotation: project dashboard
+  00_System:
+    default_include: true
+    weight: 0.85
+    annotation: system policy
+  06_Raw:
+    default_include: true
+    weight: 0.5
+    annotation: raw evidence, unprocessed
+  60_Open_Questions:
+    default_include: false
+    weight: 0.45
+    annotation: open question
+  70_Contradictions:
+    default_include: false
+    weight: 0.45
+    annotation: contradiction / unresolved
+  80_Reviews:
+    default_include: false
+    weight: 0.35
+    annotation: low-confidence / possible hallucination
+
+# 위 목록에 없는 계층(루트 문서 등)의 기본값
+default_layer:
+  default_include: true
+  weight: 0.8
+  annotation: ""
+
+# 신뢰도(frontmatter confidence) 가중치. 미표기는 default(패널티 없음).
+confidence_weight:
+  high: 1.0
+  medium: 0.85
+  low: 0.6
+default_confidence_weight: 1.0
+
+# 상태(frontmatter status) 가중치. 폐기/대체/낡음은 강등.
+status_weight:
+  active: 1.0
+  evergreen: 1.0
+  open: 1.0
+  superseded: 0.3
+  rejected: 0.25
+  deprecated: 0.3
+  stale: 0.4
+default_status_weight: 1.0
+
+# 06_Raw 임베딩 정책 (현재: 전부 임베딩 = dense 검색 가능).
+# TODO(engine): 하위 폴더별로 embed/search 조정 가능하게 열어둔다. 예)
+#   raw_policy:
+#     embed: true
+#     subfolders:
+#       06_Raw/screenshots:
+#         embed: false   # OCR 캡션만 BM25로
+#       06_Raw/papers:
+#         embed: true
+raw_policy:
+  embed: true
