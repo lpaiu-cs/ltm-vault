@@ -183,11 +183,19 @@ def init_database(db_path):
         )
     """)
 
+    # 주의: edges.source_id/target_id에 FK(REFERENCES nodes)를 걸지 않는다.
+    # DuckDB는 FK가 참조하는 부모행을 UPDATE할 때(임베딩 갱신 등) 내부적으로
+    # delete+insert로 처리해 "still referenced by a foreign key" 오류를 낸다
+    # (DuckDB FK 한계). 노드 임베딩/메타 UPDATE가 edge에 참조되는 순간 깨지므로
+    # FK를 제거한다. 참조 무결성은 앱 레벨에서 보장한다:
+    #   - indexer: title_to_id로 타깃 해석 + dangling edge skip
+    #   - mcp_server: reconcile_graph()/sync_vault(force=True)로 정합
+    # predicate 9-화이트리스트 CHECK과 자기참조 금지 CHECK는 유지한다.
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS edges (
             edge_id      UUID PRIMARY KEY,
-            source_id    UUID REFERENCES nodes(node_id),
-            target_id    UUID REFERENCES nodes(node_id),
+            source_id    UUID,
+            target_id    UUID,
             predicate    VARCHAR NOT NULL CHECK (
                 predicate IN ({preds_sql})
             ),

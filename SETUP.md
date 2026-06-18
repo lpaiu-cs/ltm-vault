@@ -198,6 +198,17 @@ ollama pull bge-m3
 
 9개 predicate 외 단어를 edge에 사용한 상태입니다. 온톨로지 헌법의 fallback rule에 맞춰 허용 predicate로 바꾸세요.
 
+### `Constraint Error: ... still referenced by a foreign key`
+
+예전 스키마(edges에 FK가 있던 버전)로 만든 `ltm_cache.db`에서 임베딩/메타 UPDATE 시
+발생합니다. DuckDB의 FK UPDATE 한계 때문이며, 현재 스키마는 FK를 제거했습니다.
+캐시는 재생성 가능하므로 DB를 지우고 다시 빌드하세요.
+
+```bash
+rm -f 90_Engine/ltm_cache.db*
+python3 90_Engine/indexer.py --force --embed --report
+```
+
 ### MCP 클라이언트에서 도구가 안 보임
 
 - 설정 파일의 JSON 문법을 확인합니다.
