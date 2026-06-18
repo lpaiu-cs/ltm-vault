@@ -80,10 +80,11 @@ VAULT_DB = os.environ.get("VAULT_DB", str(SCRIPT_DIR / "ltm_cache.db"))
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "bge-m3")
 
-# 아카이브 계층(05_Inbox/06_Raw)은 node 네임스페이스에서 제외한다.
-# raw/inbox는 wikilink 타깃이 아니라 source_path(상대 경로)로만 참조되며,
-# 인덱싱 가능한 대리물은 50_Source_Summaries의 source-summary node다.
-# (indexer.collect_markdown_files의 exclude 기본값과 일치해야 한다.)
+# 링크/편집 네임스페이스 제외 목록. list_notes()와 _find_note_path()가 사용한다.
+# 05_Inbox/06_Raw는 wikilink/edge 타깃이 아니라 source_path로만 참조되므로 여기서 제외.
+# 주의: 이는 "검색 인덱싱" 제외와 다르다. indexer는 06_Raw를 full-text 전용으로
+# 인덱싱(검색 가능)하되 graph_node=False라 링크 타깃은 아니다. 즉 이 목록과
+# indexer의 policy_for(graph_node=False)는 일관된다. 05_Inbox만 완전 제외.
 EXCLUDE_PARTS = ("90_Engine", ".git", ".obsidian", "05_Inbox", "06_Raw")
 EDGE_HEADING = "## 핵심 엣지"
 EMPTY_EDGE_PLACEHOLDER = "<!-- 아직 엣지 없음 -->"
@@ -327,24 +328,37 @@ mcp = FastMCP("karpathy-vault-ltm")
 # ===== 읽기 도구 (원본 유지) ===============================================
 @mcp.tool()
 def retrieve_knowledge(query: str, top_k: int = 5, max_hops: int = 2,
-                       max_nodes: int = 10) -> dict:
+                       max_nodes: int = 10, include_raw: bool = True,
+                       include_reviews: bool = False,
+                       confidence_weighting: bool = True) -> dict:
     """Vault에서 자연어 쿼리에 가장 의미적으로 가까운 지식 서브그래프를 검색하여
     하이브리드 캡슐 포맷(JSON 메타 + XML 감싼 마크다운 본문)으로 반환합니다.
 
     9개 술어 그래프 위에서 BM25 + Dense embedding을 RRF로 결합해 seed nodes를
     찾고, Adaptive 2-hop graph expansion으로 의미 서브그래프를 확장합니다.
 
+    [계층/신뢰도 인지] 검증된 지식 계층(20_Concepts/50_Source_Summaries 등)은
+    높게, 원본(06_Raw, full-text 전용)·낮은 신뢰도·폐기 상태는 낮게 랭크됩니다.
+    검토/메타 계층(60/70/80)은 기본 검색에서 제외됩니다(include_reviews=True로 포함).
+    결과 JSON의 각 node에는 layer/confidence/status가 함께 표기되어, 출처와
+    불확실성을 직접 판단할 수 있습니다.
+
     Args:
         query: 자연어 질문 (한국어/영어 혼합 가능)
         top_k: 1차 검색 seed nodes 수 (기본 5)
         max_hops: 그래프 확장 최대 hop (기본 2)
         max_nodes: 출력 캡슐 최대 node 수 (기본 10)
+        include_raw: 06_Raw 원본(full-text 전용)을 후보에 포함 (기본 True, 강등됨)
+        include_reviews: 60/70/80 검토·메타 계층 포함 (기본 False)
+        confidence_weighting: confidence(low/medium) 강등 적용 (기본 True)
 
     참고: 호출 시 debounce 조건이 맞으면 그동안의 변경을 자동으로 1회 정합한다.
     """
     _maybe_auto_reconcile()
     r = get_retriever()
-    return r.retrieve(query, top_k=top_k, max_hops=max_hops, max_nodes=max_nodes)
+    return r.retrieve(query, top_k=top_k, max_hops=max_hops, max_nodes=max_nodes,
+                      include_raw=include_raw, include_reviews=include_reviews,
+                      confidence_weighting=confidence_weighting)
 
 
 @mcp.tool()
@@ -394,6 +408,80 @@ def vault_stats() -> dict:
         "predicate_distribution": {p: c for p, c in pred_rows},
         "hub_top5_in_degree": {t: d for t, d in hub_rows},
         "authority_top5_out_degree": {t: d for t, d in auth_rows},
+    }
+
+
+# ===== 검토 큐 위생 도구 ====================================================
+REVIEW_QUEUE_DIRS = ("60_Open_Questions", "70_Contradictions", "80_Reviews")
+_REVIEW_ITEM_RE = re.compile(r"^###\s*\[(?P<status>[A-Za-z\-]+)\]\s*(?P<title>.+?)\s*$")
+
+
+@mcp.tool()
+def review_queue(status: str = "open", layer: Optional[str] = None) -> dict:
+    """검토·질문·모순 큐(60/70/80)에서 항목을 모아 상태별로 반환합니다.
+
+    각 큐 파일의 `### [status] 제목` 항목과 파일 frontmatter(type/reason/category)를
+    스캔합니다. 검토 큐가 쌓이기만 하고 비워지지 않는 것을 막기 위한 위생 도구입니다.
+    (검토 카테고리/상태 정의는 00_System/Review Policy.md)
+
+    Args:
+        status: 필터할 항목 상태 (open/reviewed/resolved/rejected/superseded).
+                "all"이면 전체.
+        layer: 특정 계층만 (예: "80_Reviews"). None이면 60/70/80 전체.
+
+    Returns:
+        {count, status_filter, files:[{path, layer, file_type, items:[{status,title}]}],
+         items:[{layer, file, status, title}]}
+    """
+    root = _vault_root()
+    want = (status or "open").strip().lower()
+    dirs = (layer,) if layer else REVIEW_QUEUE_DIRS
+    files_out, items_flat = [], []
+    for d in dirs:
+        base = root / d
+        if not base.exists():
+            continue
+        for p in sorted(base.rglob("*.md")):
+            if any(part in EXCLUDE_PARTS for part in p.parts):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            meta = indexer_mod.parse_yaml_frontmatter(text)
+            items = []
+            in_code = False
+            for line in text.splitlines():
+                st = line.strip()
+                if st.startswith("```"):
+                    in_code = not in_code
+                    continue
+                if in_code:
+                    continue
+                m = _REVIEW_ITEM_RE.match(st)
+                if m:
+                    s = m.group("status").lower()
+                    if want == "all" or s == want:
+                        item = {"status": s, "title": m.group("title")}
+                        items.append(item)
+                        items_flat.append({
+                            "layer": d, "file": str(p.relative_to(root)),
+                            "status": s, "title": m.group("title"),
+                        })
+            files_out.append({
+                "path": str(p.relative_to(root)),
+                "layer": d,
+                "file_type": meta.get("type"),
+                "reason": meta.get("reason"),
+                "category": meta.get("category"),
+                "open_items": len(items),
+                "items": items,
+            })
+    return {
+        "count": len(items_flat),
+        "status_filter": want,
+        "files": files_out,
+        "items": items_flat,
     }
 
 

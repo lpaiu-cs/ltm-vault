@@ -25,7 +25,7 @@
 
 | 계층 | 경로 | 역할 |
 |------|------|------|
-| **아카이브 (Archive)** | `05_Inbox/`, `06_Raw/` | 미처리 인입 → 불변 원본(진실의 원천). 인덱싱 제외. |
+| **아카이브 (Archive)** | `05_Inbox/`, `06_Raw/` | 미처리 인입(05_Inbox, 인덱싱 제외) → 불변 원본(06_Raw, 전문검색 전용·그래프 제외). |
 | **위키/지식 (Wiki/Knowledge)** | `20_Concepts/`, `50_Source_Summaries/`, `10_MOC/` | 원본 요약과 내구성 개념 지식, 탐색 지도. |
 | **프로젝트 (Project)** | `30_Projects/` | 활성 작업 대시보드. |
 | **결정 (Decision)** | `40_Decisions/` | 중요 선택과 근거. 기존 결정은 불변(supersede 방식). |
@@ -69,20 +69,20 @@ llm-vault/
 │   ├── Review Policy.md
 │   └── Naming Convention.md
 ├── 05_Inbox/                  # 미처리 인입 (인덱싱 제외)
-├── 06_Raw/                    # 불변 원본 = 진실의 원천 (인덱싱 제외)
+├── 06_Raw/                    # 불변 원본 = 진실의 원천 (전문검색 전용, 그래프 제외)
 ├── 10_MOC/                    # 탐색 지도 (Map of Content)
-├── 20_Concepts/              # 내구성 개념 지식
-├── 30_Projects/              # 활성 작업 대시보드
-├── 40_Decisions/             # 결정 기록
-├── 50_Source_Summaries/      # 원본 압축 이해
-├── 60_Open_Questions/        # 미해결 질문
-├── 70_Contradictions/        # 모순·낡은 가정 보존
-├── 80_Reviews/               # 사람 검증 큐
-└── 90_Engine/                # 런타임/인덱스/MCP
+├── 20_Concepts/               # 내구성 개념 지식
+├── 30_Projects/               # 활성 작업 대시보드
+├── 40_Decisions/              # 결정 기록
+├── 50_Source_Summaries/       # 원본 압축 이해
+├── 60_Open_Questions/         # 미해결 질문
+├── 70_Contradictions/         # 모순·낡은 가정 보존
+├── 80_Reviews/                # 사람 검증 큐
+└── 90_Engine/                 # 런타임/인덱스/MCP
     ├── indexer.py
     ├── retriever.py
     ├── mcp_server.py
-    └── ltm_cache.db
+    └── ltm_cache.db           # local generated cache, ignored by git
 ```
 
 숫자 접두사는 Obsidian의 자연 정렬과 읽기 순서를 위한 것입니다. 핵심 규칙은
@@ -100,6 +100,10 @@ node는 사람이 직접 Markdown으로 작성해도 되고, MCP write 도구로
 - dangling edge가 생기면 자동 정합이 처리하거나 `reconcile_graph()`로 즉시 정리합니다.
 - **모든 source를 concept node로 만들지 않습니다.** 기본 도착지는
   `50_Source_Summaries/`이며, 내구성 지식만 `20_Concepts/`로 승격합니다.
+- 검색은 **계층/신뢰도 인지**입니다. `06_Raw/`는 전문검색 전용으로 검색되되 강등되고,
+  낮은 신뢰도·폐기 항목도 강등+표기되며, 검토 계층(`60/70/80`)은 기본 검색에서 빠집니다
+  (`retrieve_knowledge(..., include_reviews=true)`로 포함). 검토 큐 점검은
+  `review_queue()`로. 근거: [[2026-06-18-layer-and-confidence-aware-retrieval]].
 
 node 작성 시 edge predicate는 아래 9개만 허용됩니다(안정적 지식 관계에만 사용).
 

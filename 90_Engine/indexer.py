@@ -61,6 +61,56 @@ DEFAULT_EMBED_MODEL = "bge-m3"
 
 
 # ─────────────────────────────────────────────────────────────
+# §1.5 Second Brain 계층별 인덱싱 정책 (per-folder index policy)
+# ─────────────────────────────────────────────────────────────
+# 디렉터리 이름 기반 단순 제외를 넘어, 계층(layer)별로 인덱싱 동작을 분리한다.
+# 각 정책 키:
+#   index       : DuckDB nodes 테이블에 node로 적재할지
+#   embed       : Ollama 임베딩(dense 검색 대상)을 만들지
+#   parse_edges : 본문에서 9술어 edge-DSL을 파싱할지
+#   graph_node  : wikilink/edge 타깃(=링크 네임스페이스, title_to_id)에 넣을지
+#   role        : 분류 라벨 (retriever가 가중치/스코프에 활용; layer는 경로에서 파생)
+#
+# 핵심 설계:
+#   - 05_Inbox : 미처리·휘발성 → 인덱싱하지 않음.
+#   - 06_Raw   : 불변 원본 → "전문검색 전용"으로 인덱싱한다. node+embed로 BM25/dense
+#                검색은 되지만, (a) edge를 파싱하지 않고(raw 채팅 로그의
+#                `[[A]] pred [[B]]` 문장이 false edge가 되는 것을 차단),
+#                (b) graph_node=False라 wikilink/edge 타깃이 되지 않는다(링크는
+#                source_path로만). retriever에서 낮은 가중치로 강등된다.
+#   - 그 외(10/20/30/40/50/60/70/80) : 해석 계층 → node+edge 풀 인덱싱.
+ALWAYS_EXCLUDE_PARTS = ("90_Engine", ".git", ".obsidian")
+
+LAYER_POLICY = {
+    "05_Inbox": {"index": False, "embed": False, "parse_edges": False,
+                 "graph_node": False, "role": "inbox"},
+    "06_Raw":   {"index": True,  "embed": True,  "parse_edges": False,
+                 "graph_node": False, "role": "raw"},
+}
+DEFAULT_POLICY = {"index": True, "embed": True, "parse_edges": True,
+                  "graph_node": True, "role": "knowledge"}
+
+
+def layer_of(path, vault_root):
+    """경로의 최상위 계층 폴더명(예: '20_Concepts')을 반환. 못 찾으면 None."""
+    try:
+        rel = path.resolve().relative_to(Path(vault_root).resolve())
+    except (ValueError, OSError):
+        return None
+    return rel.parts[0] if rel.parts else None
+
+
+def policy_for(path, vault_root):
+    """파일에 적용할 계층 정책 dict 반환 (layer 키 포함)."""
+    if any(part in ALWAYS_EXCLUDE_PARTS for part in path.parts):
+        return {"layer": None, "index": False, "embed": False,
+                "parse_edges": False, "graph_node": False, "role": "engine"}
+    layer = layer_of(path, vault_root)
+    base = LAYER_POLICY.get(layer, DEFAULT_POLICY)
+    return {"layer": layer, **base}
+
+
+# ─────────────────────────────────────────────────────────────
 # §2. Ollama 임베딩 클라이언트 (urllib 표준 라이브러리만 사용)
 # ─────────────────────────────────────────────────────────────
 def ollama_embed(text, model=DEFAULT_EMBED_MODEL, base_url=DEFAULT_OLLAMA_URL, timeout=30):
@@ -212,24 +262,13 @@ def strip_frontmatter_for_embedding(content):
 # ─────────────────────────────────────────────────────────────
 # §5. 인덱싱 파이프라인
 # ─────────────────────────────────────────────────────────────
-def collect_markdown_files(vault_root, exclude=(
-    "90_Engine", ".git", ".obsidian",
-    # Second Brain 아카이브 계층: 인덱싱 대상에서 제외한다.
-    #  - 05_Inbox: 아직 처리되지 않은 미가공 인입물(휘발성)
-    #  - 06_Raw  : 불변 원본(증거). raw 채팅 로그 등은 `[[A]] pred [[B]]` 형태의
-    #              문장을 포함할 수 있어 false edge를 유발하고, 그래프를 오염시킨다.
-    # 원본은 50_Source_Summaries의 source-summary node(= source_path로 raw를 가리킴)가
-    # 인덱싱 가능한 대리물 역할을 한다. 즉 "raw는 진실의 원천이되 그래프 node는 아니다".
-    "05_Inbox", "06_Raw",
-)):
-    # TODO(engine): 폴더별 인덱싱 정책을 명시적으로 분리(예: 06_Raw는 전문 검색만,
-    #   30_Projects/40_Decisions는 node+edge, 80_Reviews는 검색 우선순위 강등)하는
-    #   per-folder index policy를 도입할 것. 현재는 디렉터리 이름 기반 단순 제외만 수행.
+def collect_markdown_files(vault_root):
+    """인덱싱 대상 마크다운을 §1.5 계층 정책(policy_for)에 따라 수집한다.
+    05_Inbox는 제외, 06_Raw는 전문검색 전용으로 포함된다."""
     files = []
     for path in vault_root.rglob("*.md"):
-        if any(part in exclude for part in path.parts):
-            continue
-        files.append(path)
+        if policy_for(path, vault_root)["index"]:
+            files.append(path)
     return sorted(files)
 
 
@@ -282,6 +321,7 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
         filename_title = path.stem
         current_hash = calculate_md5(content)
         metadata = parse_yaml_frontmatter(content)
+        pol = policy_for(path, vault_root)
 
         existing_uuid, existing_hash, existing_model = get_existing_node(conn, str(path))
 
@@ -301,7 +341,7 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
                 current_hash,
                 datetime.now(),
             ])
-            if embed:
+            if embed and pol["embed"]:
                 needs_embedding.add((node_uuid, path, content))
         elif existing_hash != current_hash:
             node_uuid = existing_uuid
@@ -320,7 +360,7 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
                 datetime.now(),
                 node_uuid,
             ])
-            if embed:
+            if embed and pol["embed"]:
                 needs_embedding.add((node_uuid, path, content))
         else:
             node_uuid = existing_uuid
@@ -328,15 +368,19 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
             if force_rebuild:
                 modified_paths.add(path)
             # 임베딩 모델이 바뀌었거나 임베딩이 없는 경우에만 재임베딩
-            if embed and existing_model != embed_model:
+            if embed and pol["embed"] and existing_model != embed_model:
                 needs_embedding.add((node_uuid, path, content))
-            elif embed and force_rebuild:
+            elif embed and pol["embed"] and force_rebuild:
                 needs_embedding.add((node_uuid, path, content))
 
         path_to_id[path] = node_uuid
-        title_to_id[filename_title] = node_uuid
-        for alias in (metadata.get("aliases") or []):
-            title_to_id.setdefault(alias, node_uuid)
+        # graph_node인 계층만 링크 네임스페이스(title_to_id)에 등록한다.
+        # 06_Raw 등 full-text 전용 node는 wikilink/edge 타깃이 되지 않으므로 제외
+        # → raw 파일명이 우연히 개념 edge의 타깃으로 해석되는 것을 막는다.
+        if pol["graph_node"]:
+            title_to_id[filename_title] = node_uuid
+            for alias in (metadata.get("aliases") or []):
+                title_to_id.setdefault(alias, node_uuid)
 
     print(f"[*] 노드 패스 완료 — 신규: {stats['nodes_new']}, 수정: {stats['nodes_updated']}, 무변경: {stats['nodes_unchanged']}")
 
@@ -366,6 +410,10 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
 
     # ── 2차 패스: 엣지 재구성 ──
     for path in modified_paths:
+        # parse_edges=False 계층(06_Raw 등)은 edge를 파싱하지 않는다.
+        # raw 채팅 로그의 `[[A]] pred [[B]]` 문장이 false edge가 되는 것을 차단.
+        if not policy_for(path, vault_root)["parse_edges"]:
+            continue
         file_source_uuid = path_to_id[path]
         conn.execute("DELETE FROM edges WHERE source_id = ?", [file_source_uuid])
         content = path.read_text(encoding="utf-8")

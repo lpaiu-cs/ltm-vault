@@ -106,7 +106,10 @@
 - **raw source / inbox / 일시적 연관을 predicate 그래프에 강제로 넣지 않는다.**
   엣지는 내구성 있는 의미 관계를 위한 것이지 모든 연결을 위한 것이 아니다.
 - 모호하면 엣지를 선언하지 않는다. ("불확실하면 비워라" — [[Ontology Specification]] §4)
-- `05_Inbox/`, `06_Raw/`는 인덱서가 그래프 node로 만들지 않는다(설계상 제외).
+- `05_Inbox/`, `06_Raw/`는 인덱서가 그래프 node로 만들지 않는다. `05_Inbox/`는 인덱싱
+  완전 제외, `06_Raw/`는 전문검색 전용으로만 인덱싱된다(검색 가능·강등, edge 미파싱,
+  wikilink/edge 타깃 아님 → 원본은 `source_path`로만 참조). 검색은 계층/신뢰도 인지로
+  raw·낮은 신뢰도·검토 항목을 강등/제외한다 ([[2026-06-18-layer-and-confidence-aware-retrieval]]).
 
 ---
 

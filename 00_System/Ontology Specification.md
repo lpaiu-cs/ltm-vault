@@ -58,9 +58,11 @@ source_urls: []
 - **raw source / inbox / decision / review / open question / contradiction 항목을
   predicate 그래프에 강제로 편입하지 않는다.** 이들은 wikilink와 frontmatter `related`로
   느슨하게 연결하고, 진짜 내구성 있는 관계가 명확할 때만 엣지를 선언한다.
-- `05_Inbox/`와 `06_Raw/`는 인덱서가 그래프 node로 만들지 않는다(설계상 제외,
-  `90_Engine/indexer.py`의 `collect_markdown_files` exclude 참조). 원본의 인덱싱
-  가능한 대리물은 `50_Source_Summaries/`의 source-summary node다.
+- `05_Inbox/`와 `06_Raw/`는 인덱서가 **그래프 node로 만들지 않는다**(`graph_node=False`,
+  `90_Engine/indexer.py`의 `LAYER_POLICY`/`policy_for` 참조). 단, `06_Raw/`는
+  *전문검색 전용*으로는 인덱싱되어(검색은 가능, 강등) edge만 파싱하지 않는다.
+  `05_Inbox/`는 완전 제외된다. 원본의 그래프상 대리물은 `50_Source_Summaries/`의
+  source-summary node다. (계층 정책: [[2026-06-18-layer-and-confidence-aware-retrieval]])
 - 해석 계층 사이의 **진짜 안정 관계**에는 엣지가 적절하다. 예:
   - 새 결정이 옛 결정을 대체: `[[새 결정]] replaces [[옛 결정]]`
   - 한 이론이 다른 이론과 정면 충돌: `[[A]] contradicts [[B]]`

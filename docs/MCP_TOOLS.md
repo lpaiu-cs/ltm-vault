@@ -8,11 +8,29 @@
 
 | 도구 | 역할 |
 |---|---|
-| `retrieve_knowledge(query, top_k=5, max_hops=2, max_nodes=10)` | 자연어 쿼리로 관련 지식 node 서브그래프를 검색합니다. BM25, dense embedding, graph expansion 결과를 캡슐 형태로 반환합니다. |
+| `retrieve_knowledge(query, top_k=5, max_hops=2, max_nodes=10, include_raw=True, include_reviews=False, confidence_weighting=True)` | 자연어 쿼리로 관련 지식 node 서브그래프를 검색합니다. BM25, dense embedding, graph expansion 결과를 캡슐 형태로 반환합니다. **계층/신뢰도 인지**로 랭킹합니다(아래 참조). |
 | `sync_vault(force=False, embed=True)` | Markdown vault를 DuckDB 캐시로 컴파일합니다. 사람이 파일을 직접 편집한 뒤 호출합니다. |
 | `vault_stats()` | node/엣지 수, 임베딩 커버리지, predicate 분포, hub/authority 상위 node를 반환합니다. |
+| `review_queue(status="open", layer=None)` | 검토·질문·모순 큐(`60/70/80`)의 항목을 상태별로 모아 반환합니다. 검토 큐 위생용. |
 
 `retrieve_knowledge()`는 자동 정합 조건이 맞으면 pending 변경분을 한 번 정리한 뒤 검색합니다.
+
+### Layer & Confidence-Aware Retrieval
+
+검색은 계층(layer)·신뢰도(confidence)·상태(status)를 인지합니다
+([[2026-06-18-layer-and-confidence-aware-retrieval]]).
+
+- 랭킹 점수 = 하이브리드 점수 × `계층 가중치 × confidence × status`.
+  - 검증된 지식(`20_Concepts`/`50_Source_Summaries`)은 높게, `06_Raw`(전문검색 전용)는
+    강등, 검토/메타(`60/70/80`)는 더 강등.
+  - `confidence: low/medium`, `status: superseded/rejected/stale`는 강등(숨기지 않음).
+- 스코프 기본값: `06_Raw`는 포함(강등), 검토/메타 계층은 **제외**.
+  - `include_reviews=True` → `60/70/80` 포함.
+  - `include_raw=False` → `06_Raw` 제외.
+  - `confidence_weighting=False` → confidence 강등 끔.
+- 반환 JSON의 `nodes[]`에는 각 node의 `layer/confidence/status/score`가 표기되고,
+  XML 캡슐의 `<node>` 태그에도 `layer/confidence/status` 속성이 붙습니다. `scope` 필드로
+  적용된 스코프를 확인할 수 있습니다. 에이전트는 이 메타로 출처·불확실성을 판단하세요.
 
 ## Write Tools
 
@@ -69,5 +87,6 @@ v2.2는 이 비용을 줄이기 위해 자동 정합 상태를 `<VAULT_DB>.recon
 4. 관계 한 개만 추가할 때는 `upsert_edge()`를 사용합니다.
 5. 변경 후 중요한 검색을 바로 해야 하면 `reconcile_graph(embed=False)`를 호출합니다.
 6. `retrieve_knowledge()`나 `vault_stats()`로 결과를 확인합니다.
+7. 주기적으로 `review_queue(status="open")`로 검토·질문·모순 큐를 점검해 비웁니다.
 
 사람이 직접 Markdown 파일을 수정한 경우에는 `sync_vault()`를 호출합니다.

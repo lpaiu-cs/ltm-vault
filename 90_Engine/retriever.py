@@ -67,6 +67,74 @@ DEFAULT_EMBED_MODEL = "bge-m3"
 
 
 # ─────────────────────────────────────────────────────────────
+# §1.5 Second Brain 계층/신뢰도 인지 검색 (layer & confidence aware)
+# ─────────────────────────────────────────────────────────────
+# 계층별 랭킹 가중치: 검증된 지식 계층은 높게, 원본(full-text)·검토/메타 계층은 강등.
+LAYER_RANK_WEIGHT = {
+    "20_Concepts":          1.0,
+    "50_Source_Summaries":  1.0,
+    "10_MOC":               0.95,
+    "40_Decisions":         0.95,
+    "30_Projects":          0.9,
+    "00_System":            0.85,
+    "06_Raw":               0.5,   # 전문검색 전용 → 강등 (요약/개념보다 낮게)
+    "60_Open_Questions":    0.45,  # 메타/검토 계층
+    "70_Contradictions":    0.45,
+    "80_Reviews":           0.35,
+}
+DEFAULT_LAYER_WEIGHT = 0.8
+
+# 신뢰도 가중치: confidence 미표기(예: evergreen 개념)는 패널티 없음(1.0)
+CONFIDENCE_WEIGHT = {"high": 1.0, "medium": 0.85, "low": 0.6}
+DEFAULT_CONFIDENCE_WEIGHT = 1.0
+
+# 상태 가중치: 폐기/대체/낡음 상태는 강등 (그 외 active/open/evergreen 등은 1.0)
+STATUS_WEIGHT = {"superseded": 0.3, "rejected": 0.25, "deprecated": 0.3,
+                 "stale": 0.4}
+DEFAULT_STATUS_WEIGHT = 1.0
+
+# 기본 검색에서 제외되는 메타/검토 계층 (include_reviews=True로 포함 가능)
+REVIEW_LAYERS = ("60_Open_Questions", "70_Contradictions", "80_Reviews")
+RAW_LAYER = "06_Raw"
+
+_LAYER_DIR_RE = re.compile(r"^\d{2}_")
+
+
+def layer_from_path(file_path):
+    """파일 경로에서 최상위 계층 폴더('NN_Name')를 추출. 없으면 None(루트 문서 등)."""
+    for part in Path(file_path).parts:
+        if _LAYER_DIR_RE.match(part):
+            return part
+    return None
+
+
+def parse_frontmatter_fields(content):
+    """frontmatter에서 스칼라 필드만 가볍게 추출(confidence/status 등). 없으면 {}."""
+    if not content.startswith("---"):
+        return {}
+    end = content.find("\n---", 3)
+    if end == -1:
+        return {}
+    out = {}
+    for line in content[3:end].splitlines():
+        s = line.strip()
+        if ":" in s and not s.startswith("-") and not s.startswith("#"):
+            k, _, v = s.partition(":")
+            out[k.strip().lower()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def compute_rank_weight(layer, confidence, status, confidence_weighting=True):
+    """계층 × 신뢰도 × 상태 가중치 곱. 1.0 기준에서 강등 요소만 반영."""
+    w = LAYER_RANK_WEIGHT.get(layer, DEFAULT_LAYER_WEIGHT)
+    if confidence_weighting and confidence:
+        w *= CONFIDENCE_WEIGHT.get(str(confidence).lower(), DEFAULT_CONFIDENCE_WEIGHT)
+    if status:
+        w *= STATUS_WEIGHT.get(str(status).lower(), DEFAULT_STATUS_WEIGHT)
+    return w
+
+
+# ─────────────────────────────────────────────────────────────
 # §2. Ollama 쿼리 임베딩 (urllib만 사용)
 # ─────────────────────────────────────────────────────────────
 def ollama_embed(text, model=DEFAULT_EMBED_MODEL, base_url=DEFAULT_OLLAMA_URL, timeout=10):
@@ -116,6 +184,7 @@ def load_vault_graph(db_path):
             content = path.read_text(encoding="utf-8")
         except Exception:
             content = ""
+        fm = parse_frontmatter_fields(content)
         nodes[nid_str] = {
             "node_id": nid_str,
             "title": title,
@@ -127,6 +196,10 @@ def load_vault_graph(db_path):
             "content": content,
             "embedding_model": emb_model,
             "has_embedding": embedding is not None,
+            # Second Brain 계층/신뢰도 메타 (경로·frontmatter에서 파생)
+            "layer": layer_from_path(fp),
+            "confidence": fm.get("confidence"),
+            "status": fm.get("status"),
         }
 
     edges = []
@@ -186,13 +259,25 @@ def dense_search_via_sql(conn, query_vec_normalized, top_k=20):
 
 def hybrid_seed_search(query, conn, nodes, top_k=5,
                         ollama_url=DEFAULT_OLLAMA_URL,
-                        embed_model=DEFAULT_EMBED_MODEL):
-    """1차 검색: BM25 + Dense (캐시된 임베딩 + Ollama 쿼리 임베딩만 1회) → RRF."""
-    node_ids = list(nodes.keys())
+                        embed_model=DEFAULT_EMBED_MODEL,
+                        allowed_ids=None, weights=None):
+    """1차 검색: BM25 + Dense (캐시된 임베딩 + Ollama 쿼리 임베딩만 1회) → RRF.
+
+    allowed_ids: 검색 후보를 이 집합으로 제한(계층 스코프 필터). None이면 전체.
+    weights:     {node_id: 가중치}. RRF 융합 점수에 곱해 계층/신뢰도를 반영.
+    """
+    if allowed_ids is None:
+        node_ids = list(nodes.keys())
+    else:
+        node_ids = [nid for nid in nodes.keys() if nid in allowed_ids]
+    if not node_ids:
+        return [], "no_candidates"
+    weights = weights or {}
+    allowed_set = set(node_ids)
     rankings = []
     used_modes = []
 
-    # BM25 sparse
+    # BM25 sparse (후보 집합만 코퍼스로)
     if HAS_BM25:
         corpus = [build_searchable_text(nodes[nid]) for nid in node_ids]
         tokenized = [tokenize_korean_english(d) for d in corpus]
@@ -203,15 +288,15 @@ def hybrid_seed_search(query, conn, nodes, top_k=5,
         rankings.append(bm25_ranking)
         used_modes.append("bm25")
 
-    # Dense (Ollama 쿼리 임베딩 1회 + DuckDB SQL)
-    has_any_cached = any(n["has_embedding"] for n in nodes.values())
+    # Dense (Ollama 쿼리 임베딩 1회 + DuckDB SQL → 후보 집합으로 필터)
+    has_any_cached = any(nodes[nid]["has_embedding"] for nid in node_ids)
     if has_any_cached:
         query_vec = ollama_embed(query, model=embed_model, base_url=ollama_url)
         if query_vec is not None:
             query_norm = normalize_vector(query_vec)
-            sql_results = dense_search_via_sql(conn, query_norm, top_k=max(top_k * 4, 20))
-            dense_ranking = [nid for nid, _ in sql_results]
-            # 캐시 없는 노드들을 뒤에 append (BM25 fallback 보장)
+            sql_results = dense_search_via_sql(conn, query_norm, top_k=max(top_k * 8, 40))
+            dense_ranking = [nid for nid, _ in sql_results if nid in allowed_set]
+            # 캐시 없는 후보들을 뒤에 append (BM25 fallback 보장)
             for nid in node_ids:
                 if nid not in dense_ranking:
                     dense_ranking.append(nid)
@@ -222,14 +307,26 @@ def hybrid_seed_search(query, conn, nodes, top_k=5,
         return [], "no_backend"
 
     fused = reciprocal_rank_fusion(rankings)
-    seed_ids = [doc_id for doc_id, _ in fused[:top_k]]
+    # 계층/신뢰도 가중치 적용 후 재정렬
+    weighted = sorted(
+        ((doc_id, score * weights.get(doc_id, 1.0)) for doc_id, score in fused),
+        key=lambda x: -x[1],
+    )
+    seed_ids = [doc_id for doc_id, _ in weighted[:top_k]]
     return seed_ids, "+".join(used_modes)
 
 
 # ─────────────────────────────────────────────────────────────
 # §5. 2차 검색: Adaptive Graph Expansion
 # ─────────────────────────────────────────────────────────────
-def adaptive_hop_expansion(seed_ids, edges, max_hops=2, threshold=ADAPTIVE_HOP_THRESHOLD):
+def adaptive_hop_expansion(seed_ids, edges, max_hops=2, threshold=ADAPTIVE_HOP_THRESHOLD,
+                           weights=None):
+    """weights: {node_id: 계층/신뢰도 가중치}. 각 노드 점수에 곱해 강등을 전파."""
+    weights = weights or {}
+
+    def nw(nid):
+        return weights.get(nid, 1.0)
+
     adj = defaultdict(list)
     for e in edges:
         adj[e["source_id"]].append((e["target_id"], e["predicate"], "out"))
@@ -239,13 +336,13 @@ def adaptive_hop_expansion(seed_ids, edges, max_hops=2, threshold=ADAPTIVE_HOP_T
     activated_edges = []
     visited = set(seed_ids)
     for sid in seed_ids:
-        node_scores[sid] = 1.0
+        node_scores[sid] = 1.0 * nw(sid)
 
     frontier_1hop = set()
     for sid in seed_ids:
         for neighbor, predicate, direction in adj[sid]:
             weight = PREDICATE_WEIGHTS.get(predicate, 0.5)
-            edge_score = node_scores[sid] * weight
+            edge_score = node_scores[sid] * weight * nw(neighbor)
             node_scores[neighbor] = max(node_scores[neighbor], edge_score)
             frontier_1hop.add(neighbor)
             activated_edges.append({
@@ -264,7 +361,7 @@ def adaptive_hop_expansion(seed_ids, edges, max_hops=2, threshold=ADAPTIVE_HOP_T
                 if neighbor in visited:
                     continue
                 weight = PREDICATE_WEIGHTS.get(predicate, 0.5)
-                edge_score = node_scores[mid] * weight * 0.7
+                edge_score = node_scores[mid] * weight * 0.7 * nw(neighbor)
                 node_scores[neighbor] = max(node_scores[neighbor], edge_score)
                 activated_edges.append({
                     "source_id": mid if direction == "out" else neighbor,
@@ -292,6 +389,7 @@ def strip_frontmatter(content):
 
 def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
                           activated_edges, nodes, max_nodes=10):
+    out_ids = [nid for nid in ranked_ids[:max_nodes] if nid in nodes]
     layer1 = {
         "query": query,
         "seed_nodes": [nodes[sid]["title"] for sid in seed_ids if sid in nodes],
@@ -301,23 +399,33 @@ def format_hybrid_output(query, seed_ids, ranked_ids, node_scores,
             for e in activated_edges
             if e["source_id"] in nodes and e["target_id"] in nodes
         ][:20],
-        "node_scores": {
-            nodes[nid]["title"]: round(node_scores[nid], 4)
-            for nid in ranked_ids[:max_nodes]
-            if nid in nodes
+        # 계층/신뢰도/상태를 함께 표기 → 에이전트가 출처·불확실성을 스스로 판단
+        "nodes": [
+            {
+                "title": nodes[nid]["title"],
+                "layer": nodes[nid].get("layer"),
+                "type": nodes[nid].get("type"),
+                "confidence": nodes[nid].get("confidence"),
+                "status": nodes[nid].get("status"),
+                "score": round(node_scores[nid], 4),
+            }
+            for nid in out_ids
+        ],
+        "node_scores": {  # 하위 호환: title → score
+            nodes[nid]["title"]: round(node_scores[nid], 4) for nid in out_ids
         },
     }
     xml_parts = ["<retrieved_vault_context>"]
-    for nid in ranked_ids[:max_nodes]:
-        if nid not in nodes:
-            continue
+    for nid in out_ids:
         n = nodes[nid]
         body = strip_frontmatter(n["content"])
-        xml_parts.append(
-            f'  <node id="{nid}" title="{n["title"]}" type="{n["type"] or ""}">\n'
-            f'{body}\n'
-            f'  </node>'
-        )
+        attrs = (f'id="{nid}" title="{n["title"]}" type="{n["type"] or ""}" '
+                 f'layer="{n.get("layer") or ""}"')
+        if n.get("confidence"):
+            attrs += f' confidence="{n["confidence"]}"'
+        if n.get("status"):
+            attrs += f' status="{n["status"]}"'
+        xml_parts.append(f'  <node {attrs}>\n{body}\n  </node>')
     xml_parts.append("</retrieved_vault_context>")
     return {
         "layer1_meta": layer1,
@@ -340,19 +448,61 @@ class Retriever:
               f"({n_with_emb} with embedding)")
 
     def retrieve(self, query, top_k=5, max_hops=2,
-                 threshold=ADAPTIVE_HOP_THRESHOLD, max_nodes=10):
+                 threshold=ADAPTIVE_HOP_THRESHOLD, max_nodes=10,
+                 include_raw=True, include_reviews=False,
+                 include_layers=None, exclude_layers=None,
+                 confidence_weighting=True):
+        """계층/신뢰도 인지 검색.
+
+        include_raw:      06_Raw(full-text 전용)를 후보에 포함할지 (기본 True, 강등됨)
+        include_reviews:  60/70/80(검토·메타) 계층 포함할지 (기본 False)
+        include_layers:   주면 이 계층들로만 제한(다른 필터 무시)
+        exclude_layers:   추가로 제외할 계층 목록
+        confidence_weighting: confidence(low/medium) 강등 적용 여부 (기본 True)
+        """
+        # ── 검색 스코프(allowed layers) 결정 ──
+        all_layers = {n.get("layer") for n in self.nodes.values()}
+        if include_layers is not None:
+            allowed_layers = set(include_layers)
+        else:
+            allowed_layers = set(all_layers)
+            if not include_reviews:
+                allowed_layers -= set(REVIEW_LAYERS)
+            if not include_raw:
+                allowed_layers.discard(RAW_LAYER)
+            if exclude_layers:
+                allowed_layers -= set(exclude_layers)
+        allowed_ids = {nid for nid, n in self.nodes.items()
+                       if n.get("layer") in allowed_layers}
+
+        # ── 계층 × 신뢰도 × 상태 가중치 ──
+        weights = {
+            nid: compute_rank_weight(n.get("layer"), n.get("confidence"),
+                                     n.get("status"), confidence_weighting)
+            for nid, n in self.nodes.items()
+        }
+
         seed_ids, mode = hybrid_seed_search(
             query, self.conn, self.nodes, top_k=top_k,
-            ollama_url=self.ollama_url, embed_model=self.embed_model
+            ollama_url=self.ollama_url, embed_model=self.embed_model,
+            allowed_ids=allowed_ids, weights=weights,
         )
         ranked_ids, node_scores, activated = adaptive_hop_expansion(
-            seed_ids, self.edges, max_hops=max_hops, threshold=threshold
+            seed_ids, self.edges, max_hops=max_hops, threshold=threshold,
+            weights=weights,
         )
+        # 출력 스코프 필터: 제외 계층은 그래프 확장으로 끌려와도 결과에서 뺀다
+        ranked_ids = [nid for nid in ranked_ids if nid in allowed_ids]
         output = format_hybrid_output(
             query, seed_ids, ranked_ids, node_scores, activated,
             self.nodes, max_nodes=max_nodes
         )
         output["mode"] = mode
+        output["scope"] = {
+            "include_raw": include_raw,
+            "include_reviews": include_reviews,
+            "allowed_layers": sorted(l for l in allowed_layers if l),
+        }
         return output
 
 
@@ -366,6 +516,9 @@ if HAS_FASTAPI:
         max_hops: int = 2
         threshold: float = ADAPTIVE_HOP_THRESHOLD
         max_nodes: int = 10
+        include_raw: bool = True
+        include_reviews: bool = False
+        confidence_weighting: bool = True
 
     app = FastAPI(title="Karpathy LLM Framework Retriever v1.1")
     _instance = None
@@ -383,7 +536,9 @@ if HAS_FASTAPI:
     def retrieve_endpoint(req: RetrieveRequest):
         return get_retriever().retrieve(
             req.query, top_k=req.top_k, max_hops=req.max_hops,
-            threshold=req.threshold, max_nodes=req.max_nodes
+            threshold=req.threshold, max_nodes=req.max_nodes,
+            include_raw=req.include_raw, include_reviews=req.include_reviews,
+            confidence_weighting=req.confidence_weighting,
         )
 
     @app.get("/health")

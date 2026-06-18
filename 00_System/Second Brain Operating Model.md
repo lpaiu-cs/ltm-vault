@@ -102,13 +102,20 @@ related:
 
 ## 4. 런타임 (90_Engine)
 
-해석 계층(`10`~`80`, 단 `05_Inbox`/`06_Raw` 제외)은 `90_Engine/indexer.py`가
-DuckDB(`ltm_cache.db`)로 컴파일하고, `retriever.py`가 BM25 + Dense + graph
-expansion으로 검색하며, `mcp_server.py`가 MCP 도구로 노출합니다. 세부는
-[../SETUP.md](../SETUP.md) 및 [../docs/MCP_TOOLS.md](../docs/MCP_TOOLS.md) 참조.
+해석 계층(`10`~`80`)은 `90_Engine/indexer.py`가 DuckDB(`ltm_cache.db`)로 컴파일하고,
+`retriever.py`가 BM25 + Dense + graph expansion으로 **계층/신뢰도 인지** 검색을
+수행하며, `mcp_server.py`가 MCP 도구로 노출합니다. 세부는 [../SETUP.md](../SETUP.md)
+및 [../docs/MCP_TOOLS.md](../docs/MCP_TOOLS.md) 참조.
 
-> `05_Inbox/`와 `06_Raw/`는 인덱싱에서 제외됩니다. 원본의 인덱싱 가능한 대리물은
-> `50_Source_Summaries/`의 source-summary node(=`source_path`로 raw를 가리킴)입니다.
+계층별 인덱싱 정책(per-folder index policy)과 신뢰도 인지 검색은
+[[2026-06-18-layer-and-confidence-aware-retrieval]] 결정을 따릅니다:
+
+> - `05_Inbox/` → 인덱싱 제외(휘발성).
+> - `06_Raw/` → **전문검색 전용** 인덱싱(검색 가능, 강등). edge 미파싱·그래프 node
+>   아님(`graph_node=False`). 원본은 `source_path`로만 참조되고, 요약
+>   (`50_Source_Summaries/`)이 그래프상 대리물 역할을 한다.
+> - 검색 랭킹은 `계층 × confidence × status` 가중치로 차등. 낮은 신뢰도·폐기 항목은
+>   강등+표기. 검토/메타 계층(`60/70/80`)은 기본 검색에서 제외(필요 시 포함 가능).
 
 ---
 
