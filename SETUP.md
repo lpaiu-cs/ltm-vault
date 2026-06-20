@@ -204,6 +204,20 @@ claude mcp add llm-vault \
 등록 후 Claude Code를 재시작하면 `retrieve_knowledge`, `review_queue`, `vault_stats`,
 `create_note` 등이 노출됩니다. 상태는 `/mcp`로 확인합니다.
 
+> ⚠️ **`.mcp.json`은 복사만으론 부족합니다.** `cp .mcp.json.example .mcp.json` 후
+> ① `<REPO>` 치환 ② `.venv` 실제 생성(venv+requirements) ③ `ltm_cache.db` 빌드(§3
+> 인덱싱; 없으면 MCP 서버가 "캐시 없음"으로 시작 실패) ④ Claude Code 재시작이 모두
+> 필요합니다.
+>
+> ⚠️ **Windows 경로 주의.** venv 파이썬이 `bin/`이 아니라 `Scripts/`에 있습니다.
+> `command`를 `<REPO>\.venv\Scripts\python.exe`로 쓰고(즉 `.venv/bin/python` ❌),
+> JSON 안에서는 경로 구분자를 `\\`로 이스케이프하세요:
+>
+> ```jsonc
+> "command": "C:\\Users\\me\\llm-vault-private\\.venv\\Scripts\\python.exe",
+> "args": ["C:\\Users\\me\\llm-vault-private\\90_Engine\\mcp_server.py"],
+> ```
+
 ### 다중 기기 설정 (clone 후 매 기기 1회)
 
 **동기화는 git 하나로 단일화합니다.** vault(마크다운)는 git으로 옮기고, **파생물은

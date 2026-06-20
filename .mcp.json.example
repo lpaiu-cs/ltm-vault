@@ -1,5 +1,5 @@
 {
-  "_comment": "Claude Code 가 프로젝트 루트에서 자동 인식하는 MCP 설정의 템플릿입니다. 이 파일을 .mcp.json 으로 복사한 뒤(cp .mcp.json.example .mcp.json) <REPO> 를 이 기기의 저장소 절대경로로 바꾸세요. .mcp.json 자체는 절대경로를 담으므로 커밋하지 않습니다(.gitignore). 자세한 내용은 SETUP.md §4 참조.",
+  "_comment": "Claude Code 가 프로젝트 루트에서 자동 인식하는 MCP 설정의 템플릿입니다. 이 파일을 .mcp.json 으로 복사한 뒤(cp .mcp.json.example .mcp.json) <REPO> 를 이 기기의 저장소 절대경로로 바꾸세요. 복사만으론 부족합니다: (1) <REPO> 치환 (2) .venv 가 실제로 존재(venv 생성+requirements 설치) (3) ltm_cache.db 가 실제로 존재(indexer 실행) (4) Claude Code 재시작. WINDOWS 주의: venv 파이썬 경로가 다릅니다 — command 를 <REPO>\\.venv\\Scripts\\python.exe 로(즉 .venv/bin/python 이 아니라 .venv\\Scripts\\python.exe), 경로 구분자는 \\\\ 로 쓰세요. .mcp.json 자체는 절대경로를 담으므로 커밋하지 않습니다(.gitignore). 자세한 내용은 SETUP.md §4 참조.",
   "mcpServers": {
     "llm-vault": {
       "command": "<REPO>/.venv/bin/python",
