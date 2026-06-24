@@ -669,8 +669,8 @@ class Retriever:
         self.conn, self.nodes, self.edges = load_vault_graph(db_path, self.vault_root)
         n_with_emb = sum(1 for n in self.nodes.values() if n["has_embedding"])
         print(f"[*] Loaded {len(self.nodes)} nodes, {len(self.edges)} edges "
-              f"({n_with_emb} with embedding)")
-        print(f"[*] Retrieval policy: {self.policy_source or 'built-in fallback (provisional prior)'}")
+              f"({n_with_emb} with embedding)", file=sys.stderr)
+        print(f"[*] Retrieval policy: {self.policy_source or 'built-in fallback (provisional prior)'}", file=sys.stderr)
 
     def retrieve(self, query, top_k=5, max_hops=2,
                  threshold=ADAPTIVE_HOP_THRESHOLD, max_nodes=10,
