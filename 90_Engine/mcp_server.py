@@ -54,10 +54,16 @@ import sys
 import uuid
 import json
 import time
+import shutil
 import contextlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl  # POSIX 파일락 (writer 직렬화). Windows에선 O_EXCL 폴백.
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -129,19 +135,101 @@ def _vault_root() -> Path:
     return Path(VAULT_ROOT).resolve()
 
 
-def _run_indexer(force: bool = False, embed: bool = True) -> dict:
-    """indexer.index_vault를 호출하되, stdout을 stderr로 리다이렉트하여
-    stdio MCP JSON-RPC 채널이 오염되지 않게 한다. 끝나면 retriever 캐시 무효화."""
-    vault_root = _vault_root()
+@contextlib.contextmanager
+def _build_lock(retries: int = 300, delay: float = 0.1):
+    """writer를 직렬화하는 빌드 락. flock은 프로세스가 죽으면 커널이 자동 해제하므로
+    크래시에 강하다. fcntl이 없으면(Windows 등) O_EXCL 락파일로 폴백한다."""
+    lock_path = Path(VAULT_DB).with_suffix(Path(VAULT_DB).suffix + ".build.lock")
+    busy = "vault이 다른 쓰기 작업으로 사용 중입니다. 잠시 후 다시 시도하세요."
+    if fcntl is not None:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            for _ in range(retries):
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    time.sleep(delay)
+            else:
+                raise RuntimeError(busy)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+    else:  # 폴백: 원자적 O_EXCL 락파일
+        for _ in range(retries):
+            try:
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                break
+            except FileExistsError:
+                time.sleep(delay)
+        else:
+            raise RuntimeError(busy)
+        try:
+            yield
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _snapshot_build():
+    """Immutable snapshot + atomic swap.
+
+    라이브 DB를 임시본(.building)으로 복사해 yield한다. 블록이 정상 종료되면
+    os.replace로 라이브 경로에 원자 교체한다. writer는 라이브 DB를 제자리에서 절대
+    열지 않고 항상 임시본만 빌드하므로, read_only reader와 같은 inode를 공유하지 않아
+    'Conflicting lock'이 구조적으로 발생하지 않는다. 이미 라이브 DB를 열어둔 in-flight
+    reader는 swap 뒤에도 옛 스냅샷(unlink된 inode)을 끝까지 읽으므로 안전하다.
+    writer끼리는 _build_lock으로 직렬화한다. 정상 swap 후 캐시를 무효화한다."""
     db_path = Path(VAULT_DB)
-    with contextlib.redirect_stdout(sys.stderr):
-        stats, conn = indexer_mod.index_vault(
-            vault_root, db_path,
-            force_rebuild=force, embed=embed,
-            ollama_url=OLLAMA_URL, embed_model=OLLAMA_MODEL,
-        )
-        conn.close()
+    tmp_path = db_path.with_suffix(db_path.suffix + ".building")
+    with _build_lock():
+        for stale in (tmp_path, Path(str(tmp_path) + ".wal")):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+        if db_path.exists():
+            shutil.copy2(db_path, tmp_path)
+        try:
+            yield tmp_path
+            os.replace(tmp_path, db_path)
+        except BaseException:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        # 우리 모델에서 라이브는 항상 단일 파일 — 떠도는 WAL이 있으면 제거
+        try:
+            Path(str(db_path) + ".wal").unlink()
+        except FileNotFoundError:
+            pass
     invalidate_retriever_cache()
+
+
+def _run_indexer(force: bool = False, embed: bool = True) -> dict:
+    """변경을 임시 스냅샷에 증분 컴파일한 뒤 원자 교체한다(reader 무중단).
+    stdout은 stderr로 리다이렉트해 stdio MCP JSON-RPC 채널 오염을 막는다."""
+    vault_root = _vault_root()
+    with _snapshot_build() as tmp_db:
+        with contextlib.redirect_stdout(sys.stderr):
+            stats, conn = indexer_mod.index_vault(
+                vault_root, tmp_db,
+                force_rebuild=force, embed=embed,
+                ollama_url=OLLAMA_URL, embed_model=OLLAMA_MODEL,
+            )
+            try:
+                conn.execute("CHECKPOINT")
+            except Exception:
+                pass
+            conn.close()
     return stats
 
 
@@ -773,34 +861,39 @@ def delete_node(title: str) -> dict:
     """
     t = _validate_title(title)
     path = _find_note_path(t)
-    get_retriever()  # DB 존재 확인(없으면 친절한 에러) + 인메모리 그래프 준비
+    get_retriever()  # DB 존재 확인(없으면 친절한 에러)
 
     node_id = None
-    with contextlib.closing(
-            retriever_mod.connect_db(VAULT_DB, read_only=False)) as conn:
-        for nid, fp, ntitle in conn.execute(
-                "SELECT node_id, file_path, title FROM nodes").fetchall():
-            if ntitle == t or Path(fp).stem == t:
-                node_id = nid
-                break
+    edges_removed, node_removed = 0, False
+    # 라이브 DB를 제자리에서 열지 않고 스냅샷에 DELETE 후 원자 교체(reader 무중단)
+    with _snapshot_build() as tmp_db:
+        with contextlib.closing(
+                retriever_mod.connect_db(str(tmp_db), read_only=False)) as conn:
+            for nid, fp, ntitle in conn.execute(
+                    "SELECT node_id, file_path, title FROM nodes").fetchall():
+                if ntitle == t or Path(fp).stem == t:
+                    node_id = nid
+                    break
 
-        edges_removed, node_removed = 0, False
-        if node_id is not None:
-            edges_removed = conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE source_id = ? OR target_id = ?",
-                [node_id, node_id]).fetchone()[0]
-            conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
-                         [node_id, node_id])
-            conn.execute("DELETE FROM nodes WHERE node_id = ?", [node_id])
-            conn.commit()
-            node_removed = True
+            if node_id is not None:
+                edges_removed = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE source_id = ? OR target_id = ?",
+                    [node_id, node_id]).fetchone()[0]
+                conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
+                             [node_id, node_id])
+                conn.execute("DELETE FROM nodes WHERE node_id = ?", [node_id])
+                conn.commit()
+                try:
+                    conn.execute("CHECKPOINT")
+                except Exception:
+                    pass
+                node_removed = True
 
     file_removed = False
     if path is not None and path.exists():
         path.unlink()
         file_removed = True
 
-    invalidate_retriever_cache()
     _mark_pending()
 
     warnings = []
