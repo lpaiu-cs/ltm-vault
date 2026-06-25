@@ -380,7 +380,8 @@ python3 90_Engine/eval_retrieval.py \
 
 ```bash
 git push                          # origin(private)로 백업 (실제 지식 포함 OK)
-scripts/sync-template.sh <커밋…>   # 프레임워크 개선만 골라 upstream(public)에 반영
+scripts/sync-template.sh <커밋…>   # 프레임워크 개선만 골라 upstream(public)에 반영 (private→public)
+scripts/pull-framework.sh         # upstream(public)의 프레임워크 갱신을 private로 가져오기 (public→private)
 ```
 
 **경계 (allowlist 기준 — "기본 차단, 명시적 허용"):**
