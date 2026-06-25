@@ -372,6 +372,7 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
         "edges_inserted": 0,
         "edges_rejected": 0,
         "edges_dangling": 0,
+        "nodes_pruned": 0,
     }
 
     # ── 1차 패스: 노드 업서트 + 임베딩 필요 판정 ──
@@ -442,6 +443,20 @@ def index_vault(vault_root, db_path, force_rebuild=False, embed=False,
                 title_to_id.setdefault(alias, node_uuid)
 
     print(f"[*] 노드 패스 완료 — 신규: {stats['nodes_new']}, 수정: {stats['nodes_updated']}, 무변경: {stats['nodes_unchanged']}")
+
+    # ── orphan prune: 디스크에서 사라진 파일의 노드 + 그 노드에 닿는 엣지(양방향) 정리 ──
+    # Markdown이 source of truth, DB는 파생 캐시다. 파일 없는 stub 노드는 존재하지 않으므로
+    # (file_path NOT NULL, dangling 타깃은 스킵), file_path가 디스크에 없는 노드는 명백한
+    # orphan이다. 노드별 존재 검사라 인덱서 스캔 범위와 무관하게 안전하다.
+    orphan_ids = [nid for nid, fp in
+                  conn.execute("SELECT node_id, file_path FROM nodes").fetchall()
+                  if not Path(fp).exists()]
+    for nid in orphan_ids:
+        conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?", [nid, nid])
+        conn.execute("DELETE FROM nodes WHERE node_id = ?", [nid])
+    stats["nodes_pruned"] = len(orphan_ids)
+    if orphan_ids:
+        print(f"[*] orphan prune — 파일이 사라진 노드 {len(orphan_ids)}개(+엣지) 제거")
 
     # ── 1.5차 패스: 임베딩 빌드 ──
     if embed and needs_embedding:

@@ -851,68 +851,61 @@ def remove_edge(source_title: str, predicate: str, target_title: str) -> dict:
 
 @mcp.tool()
 def delete_node(title: str) -> dict:
-    """node를 안전하게 삭제합니다: .md 파일 + DB node + 그 node에 연결된 엣지(양방향).
+    """node를 삭제합니다: .md 파일을 지우면 인덱서가 파생 캐시(DB node + 양방향 엣지)를
+    재정합하여 정리합니다.
 
-    indexer는 디스크에서 사라진 파일의 DB node를 자동 정리하지 않으므로,
-    이 도구가 DB까지 직접 정리합니다.
-
-    주의: 다른 node가 이 제목을 링크하고 있었다면 그 엣지는 dangling이 됩니다.
-    sync_vault(force=True, embed=False)로 정리하세요.
+    Markdown이 source of truth이므로 '파일 삭제'가 1차이고 DB는 따라옵니다. 파일을 지운 뒤
+    force 재인덱싱이 (a) 파일이 사라진 orphan 노드와 그에 닿는 엣지를 제거하고, (b) 다른
+    node가 이 제목을 링크해 생긴 dangling 엣지까지 한 번에 정리합니다. 부분 실패(파일은
+    지웠으나 재인덱싱 실패)도 다음 sync가 orphan을 정리하므로 자가 치유됩니다.
 
     Args:
         title: 삭제할 node 제목
     """
     t = _validate_title(title)
     path = _find_note_path(t)
-    if not Path(VAULT_DB).exists():  # 존재 확인만 — 전체 그래프 적재(get_retriever) 불필요
+    if not Path(VAULT_DB).exists():
         raise RuntimeError(
             f"DuckDB 캐시가 없습니다: {VAULT_DB}\n"
             f"먼저 'python3 indexer.py --embed --force' 실행 필요"
         )
 
-    node_id = None
-    edges_removed, node_removed = 0, False
-    # 라이브 DB를 제자리에서 열지 않고 스냅샷에 DELETE 후 원자 교체(reader 무중단)
-    with _snapshot_build() as tmp_db:
-        with contextlib.closing(
-                retriever_mod.connect_db(str(tmp_db), read_only=False)) as conn:
-            for nid, fp, ntitle in conn.execute(
-                    "SELECT node_id, file_path, title FROM nodes").fetchall():
-                if ntitle == t or Path(fp).stem == t:
-                    node_id = nid
-                    break
+    # 보고용: 삭제 전 노드/엣지 수를 read-only로 조회(캐시는 건드리지 않음)
+    node_id, edges_removed = None, 0
+    with contextlib.closing(
+            retriever_mod.connect_db(VAULT_DB, read_only=True)) as conn:
+        for nid, fp, ntitle in conn.execute(
+                "SELECT node_id, file_path, title FROM nodes").fetchall():
+            if ntitle == t or Path(fp).stem == t:
+                node_id = nid
+                break
+        if node_id is not None:
+            edges_removed = conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE source_id = ? OR target_id = ?",
+                [node_id, node_id]).fetchone()[0]
 
-            if node_id is not None:
-                edges_removed = conn.execute(
-                    "SELECT COUNT(*) FROM edges WHERE source_id = ? OR target_id = ?",
-                    [node_id, node_id]).fetchone()[0]
-                conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
-                             [node_id, node_id])
-                conn.execute("DELETE FROM nodes WHERE node_id = ?", [node_id])
-                conn.commit()  # close가 체크포인트; 잔여 WAL은 _snapshot_build가 swap 전 접어 넣음
-                node_removed = True
-
+    # 1) source of truth(파일) 먼저 제거 — 실패하면 DB를 건드리기 전에 에러가 전파(불일치 없음)
     file_removed = False
     if path is not None and path.exists():
         path.unlink()
         file_removed = True
 
-    _mark_pending()
+    # 2) 인덱서가 orphan 노드 + 엣지를 정리하고 dangling을 재정합(force). reader 무중단(스냅샷).
+    stats = _run_indexer(force=True, embed=False)
+    _mark_reconciled()
+    node_removed = (node_id is not None) and (path is None or not path.exists())
 
     warnings = []
-    if not node_removed:
-        warnings.append("DB에 해당 node가 없었습니다(동기화 전이거나 title 불일치).")
-    if not file_removed:
-        warnings.append("디스크에 .md 파일이 없었습니다.")
-    warnings.append(
-        "다른 node가 이 제목을 링크했다면 이제 dangling입니다. "
-        "sync_vault(force=True, embed=False)로 정리하세요."
-    )
+    if node_id is None and not file_removed:
+        warnings.append("해당 제목의 node도 .md 파일도 찾지 못했습니다(title 불일치 가능).")
+    elif node_id is not None and not file_removed:
+        warnings.append("DB에 node는 있었으나 .md 파일을 못 찾아, orphan 노드만 정리했습니다.")
     return {
         "deleted_title": t,
         "node_removed": node_removed,
         "edges_removed": edges_removed,
         "file_removed": file_removed,
+        "nodes_pruned": stats.get("nodes_pruned", 0),
         "warnings": warnings,
     }
 
