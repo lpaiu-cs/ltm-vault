@@ -274,8 +274,25 @@ def _snapshot_build():
 
 
 def _run_indexer(force: bool = False, embed: bool = True) -> dict:
-    """변경을 임시 스냅샷에 증분 컴파일한 뒤 원자 교체한다(reader 무중단).
+    """DB 인덱싱을 수행한다.
+
+    USE_DAEMON이면 단일 소유자 데몬의 /reindex로 위임한다(데몬만 DB를 만짐). 데몬에 닿지
+    못하면 **에러로 거절** — in-process로 폴백하면 두 writer가 생겨 split-brain이 되므로
+    절대 폴백하지 않는다(설계 결정 #2). USE_DAEMON off면 in-process 스냅샷 경로를 쓴다.
     stdout은 stderr로 리다이렉트해 stdio MCP JSON-RPC 채널 오염을 막는다."""
+    if USE_DAEMON:
+        port = _get_daemon_port()
+        if not port:
+            raise RuntimeError(
+                "vault 데몬에 연결할 수 없어 쓰기를 수행하지 않았습니다. "
+                "(데몬이 DB 단일 소유자 — in-process 폴백은 split-brain이라 금지). "
+                "잠시 후 다시 시도하세요."
+            )
+        stats = daemon_client.post(port, "/reindex",
+                                   {"force": force, "embed": embed}, timeout=900)
+        invalidate_retriever_cache()  # 프록시 측 캐시도 무효화(데몬-다운 read 폴백 일관성)
+        return stats
+
     vault_root = _vault_root()
     with _snapshot_build() as tmp_db:
         with contextlib.redirect_stdout(sys.stderr):
