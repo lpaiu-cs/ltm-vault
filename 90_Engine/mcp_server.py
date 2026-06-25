@@ -59,6 +59,7 @@ import contextlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from collections import Counter
 
 try:
     import fcntl  # POSIX 파일락 (writer 직렬화). Windows에선 O_EXCL 폴백.
@@ -189,28 +190,36 @@ def _snapshot_build():
     writer끼리는 _build_lock으로 직렬화한다. 정상 swap 후 캐시를 무효화한다."""
     db_path = Path(VAULT_DB)
     tmp_path = db_path.with_suffix(db_path.suffix + ".building")
-    with _build_lock():
-        for stale in (tmp_path, Path(str(tmp_path) + ".wal")):
+    tmp_wal = Path(str(tmp_path) + ".wal")
+    live_wal = Path(str(db_path) + ".wal")
+
+    def _unlink(*paths):
+        for p in paths:
             try:
-                stale.unlink()
+                p.unlink()
             except FileNotFoundError:
                 pass
+
+    with _build_lock():
+        _unlink(tmp_path, tmp_wal)
         if db_path.exists():
             shutil.copy2(db_path, tmp_path)
+            # 라이브에 미체크포인트 WAL이 남아 있으면 함께 복사해 데이터 보존
+            if live_wal.exists():
+                shutil.copy2(live_wal, tmp_wal)
         try:
             yield tmp_path
+            # swap 전에 스냅샷을 단일 파일로 보장: 남은 WAL을 접어 넣는다
+            if tmp_wal.exists():
+                with contextlib.closing(
+                        retriever_mod.connect_db(str(tmp_path), read_only=False)) as c:
+                    c.execute("CHECKPOINT")
             os.replace(tmp_path, db_path)
         except BaseException:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
+            _unlink(tmp_path, tmp_wal)
             raise
-        # 우리 모델에서 라이브는 항상 단일 파일 — 떠도는 WAL이 있으면 제거
-        try:
-            Path(str(db_path) + ".wal").unlink()
-        except FileNotFoundError:
-            pass
+        # swap 후 떠도는 WAL 제거(라이브/임시 모두) — 라이브는 항상 단일 파일
+        _unlink(live_wal, tmp_wal)
     invalidate_retriever_cache()
 
 
@@ -225,11 +234,7 @@ def _run_indexer(force: bool = False, embed: bool = True) -> dict:
                 force_rebuild=force, embed=embed,
                 ollama_url=OLLAMA_URL, embed_model=OLLAMA_MODEL,
             )
-            try:
-                conn.execute("CHECKPOINT")
-            except Exception:
-                pass
-            conn.close()
+            conn.close()  # close가 체크포인트; 잔여 WAL은 _snapshot_build가 swap 전 접어 넣음
     return stats
 
 
@@ -473,32 +478,30 @@ def sync_vault(force: bool = False, embed: bool = True) -> dict:
 def vault_stats() -> dict:
     """현재 Vault 그래프 통계: node/엣지 수, 임베딩 커버리지, 술어 분포,
     Hub Top 5(in-degree), Authority Top 5(out-degree)."""
+    # 단일 출처(인메모리 그래프)에서 모두 도출 — 동시 write swap과의 불일치 방지 + DB 왕복 제거
     r = get_retriever()
-    with contextlib.closing(
-            retriever_mod.connect_db(VAULT_DB, read_only=True)) as conn:
-        pred_rows = conn.execute("""
-            SELECT predicate, COUNT(*) AS cnt FROM edges
-            GROUP BY predicate ORDER BY cnt DESC
-        """).fetchall()
-        hub_rows = conn.execute("""
-            SELECT n.title, COUNT(e.edge_id) AS deg FROM nodes n
-            LEFT JOIN edges e ON e.target_id = n.node_id
-            GROUP BY n.title ORDER BY deg DESC, n.title LIMIT 5
-        """).fetchall()
-        auth_rows = conn.execute("""
-            SELECT n.title, COUNT(e.edge_id) AS deg FROM nodes n
-            LEFT JOIN edges e ON e.source_id = n.node_id
-            GROUP BY n.title ORDER BY deg DESC, n.title LIMIT 5
-        """).fetchall()
+
+    def _title(nid):
+        n = r.nodes.get(str(nid))
+        return n["title"] if n else str(nid)
+
+    pred_counts = Counter(e["predicate"] for e in r.edges)
+    in_deg = Counter(_title(e["target_id"]) for e in r.edges)
+    out_deg = Counter(_title(e["source_id"]) for e in r.edges)
+
+    def _top5(counter):
+        ranked = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+        return {t: d for t, d in ranked}
+
     n_emb = sum(1 for n in r.nodes.values() if n["has_embedding"])
     return {
         "nodes_total": len(r.nodes),
         "edges_total": len(r.edges),
         "embedding_coverage": f"{n_emb}/{len(r.nodes)}",
         "embedding_model": OLLAMA_MODEL,
-        "predicate_distribution": {p: c for p, c in pred_rows},
-        "hub_top5_in_degree": {t: d for t, d in hub_rows},
-        "authority_top5_out_degree": {t: d for t, d in auth_rows},
+        "predicate_distribution": dict(pred_counts.most_common()),
+        "hub_top5_in_degree": _top5(in_deg),
+        "authority_top5_out_degree": _top5(out_deg),
     }
 
 
@@ -861,7 +864,11 @@ def delete_node(title: str) -> dict:
     """
     t = _validate_title(title)
     path = _find_note_path(t)
-    get_retriever()  # DB 존재 확인(없으면 친절한 에러)
+    if not Path(VAULT_DB).exists():  # 존재 확인만 — 전체 그래프 적재(get_retriever) 불필요
+        raise RuntimeError(
+            f"DuckDB 캐시가 없습니다: {VAULT_DB}\n"
+            f"먼저 'python3 indexer.py --embed --force' 실행 필요"
+        )
 
     node_id = None
     edges_removed, node_removed = 0, False
@@ -882,11 +889,7 @@ def delete_node(title: str) -> dict:
                 conn.execute("DELETE FROM edges WHERE source_id = ? OR target_id = ?",
                              [node_id, node_id])
                 conn.execute("DELETE FROM nodes WHERE node_id = ?", [node_id])
-                conn.commit()
-                try:
-                    conn.execute("CHECKPOINT")
-                except Exception:
-                    pass
+                conn.commit()  # close가 체크포인트; 잔여 WAL은 _snapshot_build가 swap 전 접어 넣음
                 node_removed = True
 
     file_removed = False

@@ -197,27 +197,11 @@ def normalize_vector(vec):
 # ─────────────────────────────────────────────────────────────
 # §3. 데이터베이스 초기화
 # ─────────────────────────────────────────────────────────────
-def _connect_rw_retry(db_path, retries=20, delay=0.25):
-    """write 연결도 락 충돌 시 잠깐 재시도한다(여러 MCP 클라이언트 동시 접근 대비).
-
-    reader가 단명 read_only 연결로 바뀌면서 writer와 겹치는 창은 짧지만,
-    겹치는 순간 'Conflicting lock'이 날 수 있어 짧게 재시도 후 진행한다."""
-    import time
-    last = None
-    for _ in range(retries):
-        try:
-            return duckdb.connect(str(db_path))
-        except Exception as e:
-            if "lock" not in str(e).lower():
-                raise
-            last = e
-            time.sleep(delay)
-    raise last
-
-
 def init_database(db_path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = _connect_rw_retry(db_path)
+    # 락-재시도 연결 헬퍼는 retriever.connect_db 단일 출처를 재사용(중복 제거)
+    from retriever import connect_db
+    conn = connect_db(str(db_path), read_only=False)
     preds_sql = ", ".join(f"'{p}'" for p in ALLOWED_PREDICATES)
 
     conn.execute("""
